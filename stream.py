@@ -333,6 +333,143 @@ def fetch_data(symbol):
 
 
 # ============================================================
+# HISTORICAL QUALITY / GROWTH
+# ============================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def historical_analysis(data):
+
+    """
+    Uses Yahoo's annual financial statements for historical quality
+    and growth signals. These support, but do not drive, valuation.
+    """
+
+    ticker = yf.Ticker(data["ticker"])
+
+    try:
+        income = ticker.financials
+    except Exception:
+        income = pd.DataFrame()
+
+    try:
+        balance = ticker.balance_sheet
+    except Exception:
+        balance = pd.DataFrame()
+
+    result = {
+        "ROE_5Y": None,
+        "Earnings_CAGR": None,
+        "FCF_Yield": None,
+    }
+
+    if income.empty or balance.empty:
+        return result
+
+    earnings_row = None
+
+    for name in (
+        "Net Income Common Stockholders",
+        "Net Income",
+    ):
+        if name in income.index:
+            earnings_row = income.loc[name]
+            break
+
+    if earnings_row is not None:
+        earnings = [
+            safe_float(earnings_row.iloc[i])
+            for i in range(len(earnings_row))
+        ]
+
+        equity_names = [
+            "Stockholders Equity",
+            "Common Stock Equity",
+            "Total Equity Gross Minority Interest",
+        ]
+
+        roe_values = []
+
+        for i in range(
+            min(
+                5,
+                len(earnings),
+                max(0, balance.shape[1] - 1),
+            )
+        ):
+            equity_previous = pick(
+                balance,
+                equity_names,
+                i + 1,
+            )
+            earnings_value = earnings[i]
+
+            if (
+                earnings_value is not None
+                and equity_previous is not None
+                and equity_previous > 0
+            ):
+                roe_values.append(
+                    earnings_value / equity_previous
+                )
+
+        if roe_values:
+            result["ROE_5Y"] = float(
+                pd.Series(roe_values).median()
+            )
+
+        valid_earnings = [
+            (i, value)
+            for i, value in enumerate(earnings)
+            if value is not None and value > 0
+        ]
+
+        if len(valid_earnings) >= 3:
+            newest_index, newest = valid_earnings[0]
+            oldest_index, oldest = valid_earnings[-1]
+            years = oldest_index - newest_index
+
+            if years > 0:
+                result["Earnings_CAGR"] = (
+                    newest / oldest
+                ) ** (1 / years) - 1
+
+    try:
+        cash_flow = ticker.cashflow
+    except Exception:
+        cash_flow = pd.DataFrame()
+
+    cfo = pick(
+        cash_flow,
+        [
+            "Operating Cash Flow",
+            "Total Cash From Operating Activities",
+        ],
+        0,
+    )
+    capex = pick(
+        cash_flow,
+        ["Capital Expenditure"],
+        0,
+    )
+    price = data["price"]
+    shares = data["shares"]
+
+    if (
+        cfo is not None
+        and capex is not None
+        and price is not None
+        and shares is not None
+        and price > 0
+        and shares > 0
+    ):
+        result["FCF_Yield"] = (
+            (cfo + capex) / (price * shares)
+        )
+
+    return result
+
+
+# ============================================================
 # PENMAN OPERATING ANALYSIS
 # ============================================================
 
@@ -933,6 +1070,71 @@ def residual_income_valuation(
 
 
 # ============================================================
+# IMPLIED ROE PERSISTENCE
+# ============================================================
+
+def calculate_implied_omega(
+    data,
+    required_return,
+    terminal_growth,
+    target_vp=1.0,
+):
+    """Find the ROE persistence needed to reach a target V/P."""
+
+    def model_vp(omega):
+        try:
+            value_to_price = residual_income_valuation(
+                data,
+                required_return=required_return,
+                omega=omega,
+                terminal_growth=terminal_growth,
+                forecast_years=5,
+            )["V/P"]
+        except (
+            ValueError,
+            KeyError,
+            TypeError,
+            ZeroDivisionError,
+            OverflowError,
+        ):
+            return None
+
+        if pd.isna(value_to_price):
+            return None
+
+        return float(value_to_price)
+
+    vp_low = model_vp(0.0)
+    vp_high = model_vp(1.0)
+
+    if vp_low is None or vp_high is None:
+        return None
+
+    if vp_low >= target_vp:
+        return 0.0
+
+    if vp_high < target_vp:
+        return None
+
+    low = 0.0
+    high = 1.0
+
+    for _ in range(50):
+        middle = (low + high) / 2
+        vp_middle = model_vp(middle)
+
+        if vp_middle is None:
+            return None
+
+        if vp_middle < target_vp:
+            low = middle
+        else:
+            high = middle
+
+    return (low + high) / 2
+
+
+# ============================================================
 # COMPLETE COMPANY ANALYSIS
 # ============================================================
 
@@ -1032,6 +1234,15 @@ def analyze_company(
         forecast_years=5,
     )
 
+    historical = historical_analysis(data)
+
+    implied_omega = calculate_implied_omega(
+        data,
+        required_return=required_return,
+        terminal_growth=terminal_growth,
+        target_vp=1.0,
+    )
+
     return {
 
         "Ticker":
@@ -1045,6 +1256,18 @@ def analyze_company(
 
         "ROE":
             base["historical_roe"],
+
+        "ROE 5Y":
+            historical["ROE_5Y"],
+
+        "Earnings CAGR":
+            historical["Earnings_CAGR"],
+
+        "FCF Yield":
+            historical["FCF_Yield"],
+
+        "Implied Omega":
+            implied_omega,
 
         "RNOA":
             operating["RNOA"],
@@ -1392,42 +1615,40 @@ if run_screener:
 
     def get_verdict(row):
 
-        if row["V/P"] < min_vp:
-
-            return "NO"
-
-        if (
-            row["V/P Cons."]
-            < min_conservative_vp
-        ):
-
-            return "NO"
+        vp = row["V/P"]
+        conservative_vp = row["V/P Cons."]
+        implied_omega = row["Implied Omega"]
 
         if (
-            pd.notna(row["ROE"])
-            and row["ROE"]
-            <= required_return
+            vp >= 1.50
+            and conservative_vp >= 1.00
+            and pd.notna(implied_omega)
+            and implied_omega <= 0.70
         ):
-
-            return "NO"
+            return "STRONG CANDIDATE"
 
         if (
-            pd.notna(row["Accruals"])
-            and row["Accruals"]
-            > max_accruals
+            vp >= min_vp
+            and conservative_vp >= min_conservative_vp
+            and (
+                pd.isna(row["ROE"])
+                or row["ROE"] > required_return
+            )
+            and (
+                pd.isna(row["Accruals"])
+                or row["Accruals"] <= max_accruals
+            )
+            and (
+                pd.isna(row["FLEV"])
+                or row["FLEV"] <= max_flev
+            )
         ):
+            return "CANDIDATE"
 
-            return "NO"
+        if vp >= 1.10:
+            return "WATCH"
 
-        if (
-            pd.notna(row["FLEV"])
-            and row["FLEV"]
-            > max_flev
-        ):
-
-            return "NO"
-
-        return "BUY"
+        return "NO"
 
     df["Verdict"] = df.apply(
         get_verdict,
@@ -1449,9 +1670,8 @@ if run_screener:
     # Summary metrics
     # --------------------------------------------------------
 
-    buy_count = (
-        df["Verdict"]
-        == "BUY"
+    candidate_count = df["Verdict"].isin(
+        ["STRONG CANDIDATE", "CANDIDATE"]
     ).sum()
 
     col1, col2, col3, col4 = st.columns(4)
@@ -1462,8 +1682,8 @@ if run_screener:
     )
 
     col2.metric(
-        "BUY",
-        int(buy_count),
+        "Candidates",
+        int(candidate_count),
     )
 
     col3.metric(
@@ -1494,6 +1714,12 @@ if run_screener:
 
         "ROE",
 
+        "ROE 5Y",
+
+        "Earnings CAGR",
+
+        "FCF Yield",
+
         "RNOA",
 
         "NBC",
@@ -1503,6 +1729,8 @@ if run_screener:
         "Spread",
 
         "Accruals",
+
+        "Implied Omega",
 
         "Base Value",
 
@@ -1534,6 +1762,18 @@ if run_screener:
 
                 "ROE":
                     "{:.1%}",
+
+                "ROE 5Y":
+                    "{:.1%}",
+
+                "Earnings CAGR":
+                    "{:.1%}",
+
+                "FCF Yield":
+                    "{:.1%}",
+
+                "Implied Omega":
+                    "{:.2f}",
 
                 "RNOA":
                     "{:.1%}",
@@ -1714,10 +1954,22 @@ if run_screener:
     # Verdict
     # --------------------------------------------------------
 
-    if selected["Verdict"] == "BUY":
+    if selected["Verdict"] == "STRONG CANDIDATE":
 
         st.success(
-            "BUY — passes the current screening rules."
+            "STRONG CANDIDATE — passes the stronger valuation and persistence checks."
+        )
+
+    elif selected["Verdict"] == "CANDIDATE":
+
+        st.success(
+            "CANDIDATE — passes the current screening rules."
+        )
+
+    elif selected["Verdict"] == "WATCH":
+
+        st.info(
+            "WATCH — valuation is interesting but does not pass all screening rules."
         )
 
     else:
