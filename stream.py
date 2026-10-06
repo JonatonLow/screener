@@ -1427,7 +1427,7 @@ if run_screener:
 
             return "NO"
 
-        return "BUY ZONE"
+        return "BUY"
 
     df["Verdict"] = df.apply(
         get_verdict,
@@ -1451,7 +1451,7 @@ if run_screener:
 
     buy_count = (
         df["Verdict"]
-        == "BUY ZONE"
+        == "BUY"
     ).sum()
 
     col1, col2, col3, col4 = st.columns(4)
@@ -1462,7 +1462,7 @@ if run_screener:
     )
 
     col2.metric(
-        "BUY ZONE",
+        "BUY",
         int(buy_count),
     )
 
@@ -1714,10 +1714,10 @@ if run_screener:
     # Verdict
     # --------------------------------------------------------
 
-    if selected["Verdict"] == "BUY ZONE":
+    if selected["Verdict"] == "BUY":
 
         st.success(
-            "BUY ZONE — passes the current screening rules."
+            "BUY — passes the current screening rules."
         )
 
     else:
