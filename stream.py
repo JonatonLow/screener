@@ -1853,13 +1853,9 @@ if run_screener:
         df["Ticker"].tolist(),
     )
 
-    selected = next(
-
-        x
-        for x in results
-        if x["Ticker"]
-        == selected_ticker
-    )
+    selected = df.loc[
+        df["Ticker"] == selected_ticker
+    ].iloc[0]
 
     base = selected["_base"]
 
