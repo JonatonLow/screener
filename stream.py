@@ -423,6 +423,7 @@ def residual_income_valuation(data, required_return, omega, terminal_growth, for
 
     equity_value = current_book_value + present_value_residual_income + pv_terminal
     value_per_share = equity_value / shares
+    intrinsic_value_per_share = value_per_share
     market_cap = price * shares
     price_to_book = market_cap / current_book_value
     value_to_price = value_per_share / price
@@ -433,6 +434,7 @@ def residual_income_valuation(data, required_return, omega, terminal_growth, for
         "historical_roe": historical_roe,
         "payout": payout_ratio,
         "value_per_share": value_per_share,
+        "intrinsic_value_per_share": intrinsic_value_per_share,
         "V/P": value_to_price,
         "P/B": price_to_book,
         "equity_value": equity_value,
@@ -569,6 +571,7 @@ def dcf_valuation(
     enterprise_value = pv_fcff + pv_terminal
     equity_value = enterprise_value - net_debt
     value_per_share = equity_value / shares
+    intrinsic_value_per_share = value_per_share
     value_to_price = value_per_share / price
 
     return {
@@ -579,6 +582,7 @@ def dcf_valuation(
         "enterprise_value": enterprise_value,
         "equity_value": equity_value,
         "value_per_share": value_per_share,
+        "intrinsic_value_per_share": intrinsic_value_per_share,
         "V/P": value_to_price,
         "wacc": wacc,
         "terminal_growth": terminal_growth,
@@ -681,9 +685,11 @@ def analyze_company(
         "Accruals": operating["accruals"],
 
         "RI Value": base["value_per_share"],
+        "RI Intrinsic Value / Share": base["intrinsic_value_per_share"],
         "RI V/P": base["V/P"],
         "RI Upside": base["V/P"] - 1.0,
         "DCF Value": dcf["value_per_share"],
+        "DCF Intrinsic Value / Share": dcf["intrinsic_value_per_share"],
         "DCF V/P": dcf["V/P"],
         "DCF Upside": dcf["V/P"] - 1.0,
 
@@ -1016,9 +1022,11 @@ if run_screener:
         "Accruals",
         "Implied Omega",
         "RI Value",
+        "RI Intrinsic Value / Share",
         "RI V/P",
         "RI Upside",
         "DCF Value",
+        "DCF Intrinsic Value / Share",
         "DCF V/P",
         "DCF Upside",
         "Net Debt",
@@ -1048,9 +1056,11 @@ if run_screener:
                 "Accruals": "{:.1%}",
                 "Implied Omega": "{:.2f}",
                 "RI Value": "${:,.2f}",
+                "RI Intrinsic Value / Share": "${:,.2f}",
                 "RI V/P": "{:.2f}x",
                 "RI Upside": "{:.1%}",
                 "DCF Value": "${:,.2f}",
+                "DCF Intrinsic Value / Share": "${:,.2f}",
                 "DCF V/P": "{:.2f}x",
                 "DCF Upside": "{:.1%}",
                 "Net Debt": "${:,.2f}",
@@ -1090,9 +1100,11 @@ if run_screener:
         st.markdown("### Valuation")
         st.write(f"**Market price:** ${selected['Price']:.2f}")
         st.write(f"**Residual Income value:** ${selected['RI Value']:.2f}")
+        st.write(f"**Final intrinsic value per share (RI):** ${selected['RI Intrinsic Value / Share']:.2f}")
         st.write(f"**RI V/P:** {selected['RI V/P']:.2f}x")
         st.write(f"**RI upside:** {selected['RI Upside']:.1%}")
         st.write(f"**DCF equity value:** ${selected['DCF Value']:.2f}")
+        st.write(f"**Final intrinsic value per share (DCF):** ${selected['DCF Intrinsic Value / Share']:.2f}")
         st.write(f"**DCF V/P:** {selected['DCF V/P']:.2f}x")
         st.write(f"**DCF upside:** {selected['DCF Upside']:.1%}")
         st.write(f"**P/B:** {selected['P/B']:.2f}x")
