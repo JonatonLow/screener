@@ -399,10 +399,11 @@ def dcf_valuation(data, wacc, g_path, g_term, margin, tax, capex_ratio, dep_rati
         rev *= 1 + g
         ebit = rev * margin
         nopat = ebit * (1 - tax)
-          dep, nwc = rev * dep_ratio, rev * nwc_ratio
-   fade = t / max(len(g_path), 1)
-   cap_r = capex_ratio + (dep_ratio * 1.1 - capex_ratio) * fade if capex_ratio > dep_ratio * 1.1 else capex_ratio
-   capex = rev * cap_r
+        dep, nwc = rev * dep_ratio, rev * nwc_ratio
+        # capex/revenue fades toward ~1.1x D&A by the last forecast year (matches the terminal reinvestment logic)
+        cap_target = dep_ratio * 1.1
+        cap_r = capex_ratio + (cap_target - capex_ratio) * (t / len(g_path)) if capex_ratio > cap_target else capex_ratio
+        capex = rev * cap_r
         d_nwc = nwc - nwc_prev
         net_inv = max(capex - dep + d_nwc, 0.0)  # growth cannot release cash in perpetuity
         fcff = nopat - net_inv
@@ -424,18 +425,22 @@ def dcf_valuation(data, wacc, g_path, g_term, margin, tax, capex_ratio, dep_rati
         "net_debt": net_debt, "enterprise_value": ev, "equity_value": equity,
         "value_per_share": vps, "V/P": vps / price, "terminal_pct": pv_tv / ev if ev else None,
         "term_roic": term_roic, "forecast": forecast,
+        "pv_explicit": pv_fcff, "pv_terminal": pv_tv, "term_fcff": term_fcff,
     }
 
 
 def implied_start_growth(data, wacc, g_term, years, dcf_inputs):
-    """Starting revenue growth the market price implies (reverse DCF)."""
+    """Starting revenue growth the market price implies (reverse DCF).
+    Returns inf if the price needs more than 50% growth, -0.10 if it is cheap even at -10% growth."""
     def vp(g0):
         return dcf_valuation(data, wacc, growth_path(g0, g_term, years), g_term, **dcf_inputs)["V/P"]
 
     try:
         lo, hi = -0.10, 0.50
-        if vp(lo) >= 1.0 or vp(hi) < 1.0:
-            return None
+        if vp(lo) >= 1.0:
+            return lo
+        if vp(hi) < 1.0:
+            return float("inf")
         for _ in range(40):
             mid = (lo + hi) / 2
             lo, hi = (mid, hi) if vp(mid) < 1.0 else (lo, mid)
@@ -588,7 +593,7 @@ with st.sidebar:
     st.divider()
     st.header("Residual income")
     omega = st.slider("ROE persistence (ω)", 0.0, 1.0, 0.80, 0.05)
-    max_pb = st.number_input("RI valid only if P/B ≤", 1.0, 100.0, 10.0, 1.0)
+    max_pb = st.number_input("RI valid only if P/B ≤", 1.0, 100.0, 6.0, 1.0)
     max_roe = st.number_input("RI valid only if ROE ≤", 0.10, 3.00, 0.50, 0.05)
 
     st.divider()
@@ -695,6 +700,7 @@ def render_results(df):
             "RI Value", "RI V/P", "RI Conservative Value", "RI Conservative V/P", "DCF Value", "DCF V/P",
             "Net Debt ($B)", "Shares Outstanding", "RI Terminal %", "DCF Terminal %", "Verdict"]
     display = df[cols].copy()
+    display["Market-Implied Growth"] = display["Market-Implied Growth"].replace(float("inf"), NAN)
     fmt = {
         "Price": "${:.2f}", "P/B": "{:.2f}x", "ROE": "{:.1%}", "Cost of Equity": "{:.1%}", "WACC": "{:.1%}",
         "Start Growth": "{:.1%}", "Market-Implied Growth": "{:.1%}", "Earnings CAGR": "{:.1%}", "FCF Yield": "{:.1%}",
@@ -722,7 +728,10 @@ def render_results(df):
         st.markdown("### Valuation")
         st.write(f"**Market price:** ${sel['Price']:.2f}")
         st.write(f"**DCF value / V/P:** ${sel['DCF Value']:.2f} / {sel['DCF V/P']:.2f}x")
-        st.write(f"**Market-implied starting growth:** {fmt_pct(sel['Market-Implied Growth'])} (model start: {fmt_pct(sel['Start Growth'])})")
+        mig = sel["Market-Implied Growth"]
+        mig_txt = ">50% (beyond model range)" if pd.notna(mig) and mig == float("inf") else (
+            "≤ -10% (cheap even with shrinking sales)" if pd.notna(mig) and mig <= -0.10 else fmt_pct(mig))
+        st.write(f"**Market-implied starting growth:** {mig_txt} (model start: {fmt_pct(sel['Start Growth'])})")
         if sel["RI Valid"]:
             st.write(f"**RI value / V/P:** ${sel['RI Value']:.2f} / {sel['RI V/P']:.2f}x")
             st.write(f"**Conservative RI value / V/P:** ${sel['RI Conservative Value']:.2f} / {sel['RI Conservative V/P']:.2f}x")
@@ -748,6 +757,33 @@ def render_results(df):
         st.info("WATCH: valuation is interesting but does not pass all rules.")
     else:
         st.warning("NO: does not pass the screening rules.")
+
+    mig, g0 = sel["Market-Implied Growth"], sel["Start Growth"]
+    if pd.isna(mig):
+        read = "The reverse DCF could not be solved for this company."
+    elif mig == float("inf"):
+        read = "The price needs more than 50% starting revenue growth, so it is far above what this DCF can justify."
+    elif mig <= -0.10:
+        read = "The price is below DCF value even if revenue shrinks 10% a year."
+    elif mig > g0 + 0.02:
+        read = f"The market prices in about {mig:.1%} starting growth versus {g0:.1%} in the model, so the stock looks expensive on these assumptions."
+    elif mig < g0 - 0.02:
+        read = f"The market needs only {mig:.1%} starting growth versus {g0:.1%} in the model, so the stock looks cheap on these assumptions."
+    else:
+        read = f"The market prices in about {mig:.1%} starting growth, close to the {g0:.1%} in the model, so it looks roughly fairly priced."
+    st.info("**Valuation read:** " + read)
+
+    st.markdown("### DCF bridge ($B except per share)")
+    bridge = pd.DataFrame([
+        ("PV of explicit-period FCFF", dcf["pv_explicit"] / 1e9),
+        ("PV of terminal value", dcf["pv_terminal"] / 1e9),
+        ("Enterprise value", dcf["enterprise_value"] / 1e9),
+        ("Less: net debt (incl. minority interest)", -dcf["net_debt"] / 1e9),
+        ("Equity value", dcf["equity_value"] / 1e9),
+        ("Value per share ($)", dcf["value_per_share"]),
+        ("Market price ($)", sel["Price"]),
+    ], columns=["Item", "Amount"])
+    st.dataframe(bridge.style.format({"Amount": "{:,.2f}"}), width="stretch", hide_index=True)
 
     if sel["warnings"]:
         with st.expander("⚠️ Data-quality warnings", expanded=not sel["RI Valid"]):
