@@ -611,8 +611,11 @@ def implied_start_growth(data, wacc, g_term, years, dcf_inputs):
         return None
 
 
-DCF_LIMITS = {"margin": (-0.20, 0.60), "tax": (0.10, 0.30), "capex_ratio": (0.0, 0.30),
-              "dep_ratio": (0.0, 0.20), "nwc_ratio": (-0.05, 0.40)}
+# Operating working capital can legitimately be negative for cash-generative businesses
+# (e.g. consumer staples with supplier/customer float). Keep broad guardrails, not a narrow
+# positive-NWC assumption; values outside these bounds are flagged and not silently clipped.
+DCF_LIMITS = {"margin": (-0.20, 0.60), "tax": (0.10, 0.30), "capex_ratio": (0.0, 0.50),
+              "dep_ratio": (0.0, 0.20), "nwc_ratio": (-0.25, 0.50)}
 DCF_LABELS = {"margin": "EBIT margin (3y avg)", "tax": "tax rate", "capex_ratio": "CapEx / revenue",
               "dep_ratio": "D&A / revenue", "nwc_ratio": "operating NWC / revenue"}
 FALLBACK_KEYS = {"margin": "fb_margin", "tax": "fb_tax", "capex_ratio": "fb_capex",
@@ -671,19 +674,26 @@ def analyze_company(data, p):
         warnings.append(f"Current shares outstanding unavailable; using {data.get('shares_source', 'an unverified fallback')}. Per-share values and market capitalization may be unreliable.")
     if data.get("beta_source") != "Yahoo beta" or data.get("beta") is None or not (0 <= data.get("beta", 1.0) <= 3.0):
         warnings.append("Yahoo beta is missing or outside the supported 0–3 range; CAPM uses a beta of 1.0. Review cost of equity.")
+    elif p["use_capm"] and data.get("beta") < 0.60:
+        warnings.append(f"Low Yahoo beta ({data['beta']:.2f}) produces a relatively low CAPM cost of equity; compare with a normalized/industry beta as a sensitivity case.")
     if data.get("roe_source") == "Yahoo-reported ROE fallback":
         warnings.append("Historical ROE could not be reconstructed from reported balance-sheet history; using Yahoo-reported ROE as a fallback. Verify the equity denominator before relying on RI.")
     if data.get("payout_ratio") is None:
         warnings.append("Dividend/buyback payout data unavailable; RI is disabled rather than assuming zero payout.")
     elif not (0 <= data["payout_ratio"] <= 1):
         warnings.append(f"Observed payout ratio is {data['payout_ratio']:.1%}, outside 0–100%; RI is disabled pending review.")
-    eq0, eq1, ni_adj = y0["equity"], y1["equity"], data["ni"]
+    reported_eq0, reported_eq1 = y0["equity"], y1["equity"]
+    eq0, eq1, ni_adj = reported_eq0, reported_eq1, data["ni"]
     adjusted = False
     if p["tangible_book"]:
         gw0, gw1 = y0["goodwill"], y1["goodwill"]
-        if gw0 is not None and gw1 is not None and eq0 and eq1:
-            eq0, eq1, adjusted = eq0 - gw0, eq1 - gw1, True
-            warnings.append("RI uses tangible book (goodwill and intangibles removed from equity).")
+        if gw0 is not None and gw1 is not None and eq0 is not None and eq1 is not None:
+            tangible0, tangible1 = eq0 - gw0, eq1 - gw1
+            if tangible0 > 0 and tangible1 > 0:
+                eq0, eq1, adjusted = tangible0, tangible1, True
+                warnings.append("RI uses tangible book (goodwill and intangibles removed from equity).")
+            else:
+                warnings.append("Tangible book is non-positive for the current or prior period; RI automatically falls back to reported book equity.")
         else:
             warnings.append("Goodwill/intangibles not reported; RI uses reported book equity.")
     rd = [v for v in (data.get("rd") or []) if v is not None and v > 0]
@@ -714,7 +724,12 @@ def analyze_company(data, p):
 
     ri_valid = base is not None
     if base and base.get("roe_was_clipped"):
-        warnings.append(f"RI ROE input {base['historical_roe']:.1%} was clipped to {base['roe_base_used']:.1%}; inspect the underlying ROE before relying on RI.")
+        ri_valid = False
+        implied_omega = None
+        warnings.append(
+            f"RI disabled: ROE input {base['historical_roe']:.1%} exceeds the model's supported range and was clipped to "
+            f"{base['roe_base_used']:.1%}. Review adjusted book equity / buyback effects before using RI."
+        )
     eq_rep = y0["equity"]
     common_equity_available = "Gross Minority Interest" not in str(y0.get("equity_source", ""))
     pb_rep = data["price"] * data["shares"] / eq_rep if common_equity_available and eq_rep and eq_rep > 0 else NAN
@@ -733,10 +748,13 @@ def analyze_company(data, p):
     rnoa = operating["RNOA"]
     high_return = rnoa is not None and rnoa >= 0.25
     hi = max(p["quality_roic_cap"] if high_return else p["roic_cap"], lo)
-    if is_growth and not p["override"]:
-        if data["ebit"] is not None and data["revenue"]:
-            dcf_inputs["margin"] = clamp(data["ebit"] / data["revenue"], *DCF_LIMITS["margin"])
-    dcf_inputs["margin_end"] = clamp(dcf_inputs["margin"] + (p["margin_expansion"] if is_growth else 0.0), -0.20, 0.60)
+    latest_margin = (data["ebit"] / data["revenue"] if data.get("ebit") is not None and data.get("revenue") else None)
+    # In growth mode, start at the available multi-year average and fade toward the latest
+    # margin; do not assume the latest peak/trough margin persists unchanged for 15 years.
+    if is_growth and not p["override"] and dcf_inputs.get("margin") is None and latest_margin is not None:
+        dcf_inputs["margin"] = clamp(latest_margin, *DCF_LIMITS["margin"])
+    margin_end_base = latest_margin if is_growth and not p["override"] and latest_margin is not None else dcf_inputs["margin"]
+    dcf_inputs["margin_end"] = clamp(margin_end_base + (p["margin_expansion"] if is_growth else 0.0), -0.20, 0.60)
     dcf_inputs["term_roic"] = clamp(rnoa if rnoa is not None else lo + 0.02, lo, hi)
     dcf = dcf_valuation(data, wacc, g_path, g_term, **dcf_inputs)
     implied_g = implied_start_growth(data, wacc, g_term, years, dcf_inputs)
@@ -758,7 +776,7 @@ def analyze_company(data, p):
     if is_growth:
         warnings.append(
             f"Growth mode: starting growth {g0:.1%} is at or above {p['growth_threshold']:.0%}, so the fade runs {years} years "
-            f"and the DCF uses the latest EBIT margin ({dcf_inputs['margin']:.1%}) ending at {dcf_inputs['margin_end']:.1%}.")
+            f"and EBIT margin fades from {dcf_inputs['margin']:.1%} toward {dcf_inputs['margin_end']:.1%}.")
     if high_return:
         warnings.append(f"High-return business (RNOA {rnoa:.0%}): terminal ROIC cap raised to {p['quality_roic_cap']:.0%}.")
     selected_roic_cap = p["quality_roic_cap"] if high_return else p["roic_cap"]
@@ -790,10 +808,10 @@ def analyze_company(data, p):
         warnings.append("WACC uses reported/book debt as a proxy for market-value debt and the configured cost of debt; market-value debt and credit spreads are not available from these Yahoo summary fields.")
     if dcf_inputs["margin"] < 0.03:
         warnings.append("Thin EBIT margin: DCF is highly sensitive to small margin changes.")
-    if dcf["terminal_pct"] is not None and dcf["terminal_pct"] > 0.80:
+    if dcf["terminal_pct"] is not None and dcf["terminal_pct"] > 0.65:
         warnings.append(
             f"Present value of terminal value is {dcf['terminal_pct']:.0%} of enterprise value; "
-            "the estimate is highly sensitive to terminal assumptions. Consider a longer explicit forecast."
+            "the estimate is materially sensitive to terminal assumptions. Stress-test terminal growth/ROIC and consider a longer explicit forecast."
         )
     dil = data.get("diluted_shares")
     if dil and data["shares"] and abs(dil - data["shares"]) / data["shares"] > 0.05:
@@ -885,7 +903,7 @@ with st.sidebar:
     terminal_growth = st.number_input("Terminal growth (both models)", -0.02, 0.04, 0.025, 0.005, format="%.3f")
     forecast_years = st.slider("Forecast years (growth fade)", 5, 15, 10)
     use_company_growth = st.checkbox("Start from company revenue CAGR", value=True)
-    max_start_growth = st.number_input("Max starting growth", 0.00, 0.40, 0.15, 0.01, format="%.2f")
+    max_start_growth = st.number_input("Max starting growth", 0.00, 0.40, 0.20, 0.01, format="%.2f")
     start_growth_fb = st.number_input("Starting growth (fallback / manual)", -0.10, 0.40, 0.06, 0.005, format="%.3f")
     growth_threshold = st.number_input("Growth mode if starting growth ≥", 0.05, 0.40, 0.10, 0.01, format="%.2f",
                                        help="Growth names get a longer fade and the latest margin instead of the 3-year average.")
