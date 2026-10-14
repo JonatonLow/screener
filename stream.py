@@ -593,7 +593,7 @@ with st.sidebar:
     st.divider()
     st.header("Residual income")
     omega = st.slider("ROE persistence (ω)", 0.0, 1.0, 0.80, 0.05)
-    max_pb = st.number_input("RI valid only if P/B ≤", 1.0, 100.0, 6.0, 1.0)
+    max_pb = st.number_input("RI valid only if P/B ≤", 1.0, 100.0, 10.0, 1.0)
     max_roe = st.number_input("RI valid only if ROE ≤", 0.10, 3.00, 0.50, 0.05)
 
     st.divider()
