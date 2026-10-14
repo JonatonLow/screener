@@ -267,14 +267,14 @@ def discount_rates(data, p):
     """Return (cost of equity, WACC)."""
     if not p["use_capm"]:
         return p["flat_ke"], p["flat_wacc"]
-    beta = clamp(data.get("beta") or 1.0, 0.6, 1.6)
-    ke = clamp(p["rf"] + beta * p["erp"], 0.06, 0.14)
+    beta = clamp(data.get("beta") or 1.0, 0.8, 1.6)
+    ke = clamp(p["rf"] + beta * p["erp"], 0.08, 0.14)
     debt = max(data["years"][0]["debt"] or 0.0, 0.0)
     mcap = data["price"] * data["shares"]
     w_d = debt / (debt + mcap) if (debt + mcap) > 0 else 0.0
     t = data.get("effective_tax_rate")
     t = 0.21 if t is None else t
-    wacc = clamp((1 - w_d) * ke + w_d * p["kd"] * (1 - t), 0.05, 0.13)
+    wacc = clamp((1 - w_d) * ke + w_d * p["kd"] * (1 - t), 0.07, 0.13)
     return ke, wacc
 
 
@@ -497,7 +497,9 @@ def analyze_company(data, p):
     base = cons = implied_omega = None
     try:
         base = residual_income_valuation(data, ke, p["omega"], g_path, g_term)
-        cons = residual_income_valuation(data, ke + 0.01, p["omega"] * 0.75, g_path, g_term)
+        # Conservative case: faster fade if ROE > ke, slower recovery if ROE < ke
+        cons_omega = p["omega"] * 0.75 if base["historical_roe"] >= ke else min(1.0, p["omega"] * 1.25)
+        cons = residual_income_valuation(data, ke + 0.01, cons_omega, g_path, g_term)
         implied_omega = calculate_implied_omega(data, ke, g_path, g_term)
     except ValueError as e:
         warnings.append(f"Residual income unavailable: {e}.")
