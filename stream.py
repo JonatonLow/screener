@@ -399,7 +399,10 @@ def dcf_valuation(data, wacc, g_path, g_term, margin, tax, capex_ratio, dep_rati
         rev *= 1 + g
         ebit = rev * margin
         nopat = ebit * (1 - tax)
-        dep, capex, nwc = rev * dep_ratio, rev * capex_ratio, rev * nwc_ratio
+          dep, nwc = rev * dep_ratio, rev * nwc_ratio
+   fade = t / max(len(g_path), 1)
+   cap_r = capex_ratio + (dep_ratio * 1.1 - capex_ratio) * fade if capex_ratio > dep_ratio * 1.1 else capex_ratio
+   capex = rev * cap_r
         d_nwc = nwc - nwc_prev
         net_inv = max(capex - dep + d_nwc, 0.0)  # growth cannot release cash in perpetuity
         fcff = nopat - net_inv
