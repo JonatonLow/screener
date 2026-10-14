@@ -1,3 +1,5 @@
+import math
+
 import pandas as pd
 import streamlit as st
 import yfinance as yf
@@ -25,11 +27,13 @@ st.caption(
 
 
 def safe_float(v):
+    """Convert scalar financial data only when it is finite and numeric."""
     try:
         if v is None or pd.isna(v):
             return None
-        return float(v)
-    except Exception:
+        value = float(v)
+        return value if math.isfinite(value) else None
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -79,6 +83,16 @@ def equity_row_source(df, col=0):
 def spend(v):
     v = safe_float(v)
     return None if v is None else abs(v)
+
+
+def payout_ratio_from_cashflows(net_income, dividends_paid, buybacks_paid):
+    """Estimate shareholder payout only when income, dividends and repurchases are all known."""
+    ni = safe_float(net_income)
+    dividends = spend(dividends_paid)
+    buybacks = spend(buybacks_paid)
+    if ni is None or ni <= 0 or dividends is None or buybacks is None:
+        return None
+    return (dividends + buybacks) / ni
 
 
 def ratio(a, b):
@@ -187,11 +201,13 @@ def fetch_data(symbol):
         cf = pd.DataFrame()
 
     price = info.get("currentPrice") or info.get("regularMarketPrice")
+    price_source = "Yahoo current/regular market price" if price is not None else None
     if price is None:
         try:
             h = t.history(period="5d")
-            if not h.empty:
+            if not h.empty and not h["Close"].dropna().empty:
                 price = float(h["Close"].dropna().iloc[-1])
+                price_source = "last available close (5-day history fallback)"
         except Exception:
             pass
 
@@ -264,13 +280,13 @@ def fetch_data(symbol):
     ni_latest = pick(inc, ["Net Income Common Stockholders", "Net Income", "Net Income Including Noncontrolling Interests", "Net Income From Continuing Operation Net Minority Interest", "Net Income From Continuing Operations"], 0)
     dividends_latest = spend(pick(cf, ["Cash Dividends Paid", "Common Stock Dividend Paid"], 0))
     buybacks_latest = spend(pick(cf, ["Repurchase Of Capital Stock", "Common Stock Payments"], 0))
-    payout_ratio = None
-    if ni_latest is not None and ni_latest > 0 and (dividends_latest is not None or buybacks_latest is not None):
-        payout_ratio = ((dividends_latest or 0.0) + (buybacks_latest or 0.0)) / ni_latest
+    payout_ratio = payout_ratio_from_cashflows(ni_latest, dividends_latest, buybacks_latest)
 
     return {
         "ticker": symbol.upper(),
         "price": safe_float(price),
+        "price_source": price_source or "unavailable",
+        "currency": px_cur or fin_cur or "unknown",
         "shares": safe_float(shares),
         "shares_source": shares_source or "unavailable",
         "sector": info.get("sector", "") or "",
@@ -459,6 +475,9 @@ def residual_income_valuation(data, ke, omega, g_path, g_term):
     pv_tv = tv / (1 + ke) ** n
     equity = bv0 + pv_ri + pv_tv
     vps = equity / shares
+    numeric_outputs = (pv_ri, terminal_roe, terminal_payout, terminal_ri, tv, pv_tv, equity, vps)
+    if any(not math.isfinite(float(v)) for v in numeric_outputs):
+        raise ValueError("residual-income calculation produced a non-finite value")
     return {
         "historical_roe": hist_roe,
         "roe_base_used": roe_base,
@@ -526,8 +545,18 @@ def dcf_valuation(data, wacc, g_path, g_term, margin, tax, capex_ratio, dep_rati
         raise ValueError("WACC must exceed terminal growth")
     if term_roic is None or term_roic <= g_term or term_roic <= 0:
         raise ValueError("terminal ROIC must be positive and exceed terminal growth")
-    if any(v is None for v in (margin, tax, capex_ratio, dep_ratio, nwc_ratio)):
-        raise ValueError("one or more DCF operating assumptions are missing")
+    if any(v is None or not pd.notna(v) for v in (margin, tax, capex_ratio, dep_ratio, nwc_ratio)):
+        raise ValueError("one or more DCF operating assumptions are missing or non-finite")
+    dcf_ratios = {"margin": margin, "tax": tax, "capex_ratio": capex_ratio,
+                  "dep_ratio": dep_ratio, "nwc_ratio": nwc_ratio}
+    for key, value in dcf_ratios.items():
+        lo, hi = DCF_HARD_LIMITS[key]
+        if not (lo <= value <= hi):
+            raise ValueError(f"{DCF_LABELS[key]} {value:.1%} is outside hard model bounds ({lo:.1%} to {hi:.1%})")
+    if margin_end is not None and (not math.isfinite(float(margin_end)) or not (DCF_HARD_LIMITS["margin"][0] <= margin_end <= DCF_HARD_LIMITS["margin"][1])):
+        raise ValueError("terminal forecast EBIT margin is outside hard model bounds")
+    if not g_path or any(g is None or not pd.notna(g) or g <= -1 for g in g_path):
+        raise ValueError("growth path is empty or contains invalid growth rates")
     y0 = data["years"][0]
     base_rev, shares, price = data["revenue"], data["shares"], data["price"]
     if not base_rev or base_rev <= 0:
@@ -538,8 +567,8 @@ def dcf_valuation(data, wacc, g_path, g_term, margin, tax, capex_ratio, dep_rati
         raise ValueError("total debt or cash unavailable; net debt cannot be estimated safely")
     if not (0 <= tax <= 0.60):
         raise ValueError("tax rate must be between 0% and 60%")
-    if not (-0.20 <= margin <= 0.60):
-        raise ValueError("EBIT margin is outside supported range")
+    if not (DCF_HARD_LIMITS["margin"][0] <= margin <= DCF_HARD_LIMITS["margin"][1]):
+        raise ValueError("EBIT margin is outside hard model bounds")
     net_debt = y0["debt"] - y0["cash"] + (y0["minority"] if y0["minority"] is not None else 0.0)
 
     rev = base_rev
@@ -547,13 +576,18 @@ def dcf_valuation(data, wacc, g_path, g_term, margin, tax, capex_ratio, dep_rati
     pv_fcff, forecast, nopat = 0.0, [], 0.0
     for t, g in enumerate(g_path, 1):
         rev *= 1 + g
-        m_t = margin + ((margin if margin_end is None else margin_end) - margin) * t / len(g_path)  # linear ramp
+        # Anchor year 1 at the observed/normalized starting margin and the final
+        # explicit year at the terminal margin; avoid shifting the entire path by 1/N.
+        fade = (t - 1) / (len(g_path) - 1) if len(g_path) > 1 else 1.0
+        end_margin = margin if margin_end is None else margin_end
+        m_t = margin + (end_margin - margin) * fade
         ebit = rev * m_t
         nopat = ebit * (1 - tax)
         dep, nwc = rev * dep_ratio, rev * nwc_ratio
-        # capex/revenue fades toward ~1.1x D&A by the last forecast year (matches the terminal reinvestment logic)
+        # Transition from observed CapEx intensity to a modest terminal maintenance
+        # level; the terminal FCFF separately ties total reinvestment to g / ROIC.
         cap_target = dep_ratio * 1.1
-        cap_r = capex_ratio + (cap_target - capex_ratio) * (t / len(g_path))
+        cap_r = capex_ratio + (cap_target - capex_ratio) * fade
         capex = rev * cap_r
         d_nwc = nwc - nwc_prev
         net_inv = capex - dep + d_nwc
@@ -572,6 +606,9 @@ def dcf_valuation(data, wacc, g_path, g_term, margin, tax, capex_ratio, dep_rati
     ev = pv_fcff + pv_tv
     equity = ev - net_debt
     vps = equity / shares
+    numeric_outputs = (net_debt, pv_fcff, term_fcff, tv, pv_tv, ev, equity, vps)
+    if any(not math.isfinite(float(v)) for v in numeric_outputs):
+        raise ValueError("DCF calculation produced a non-finite value")
     return {
         "net_debt": net_debt, "enterprise_value": ev, "equity_value": equity,
         "value_per_share": vps, "V/P": vps / price, "terminal_pct": pv_tv / ev if ev > 0 else None,
@@ -611,11 +648,13 @@ def implied_start_growth(data, wacc, g_term, years, dcf_inputs):
         return None
 
 
-# Operating working capital can legitimately be negative for cash-generative businesses
-# (e.g. consumer staples with supplier/customer float). Keep broad guardrails, not a narrow
-# positive-NWC assumption; values outside these bounds are flagged and not silently clipped.
+# Soft guardrails are diagnostic ranges, not clipping limits. Real companies can
+# legitimately sit outside them (especially CapEx and operating working capital).
+# Hard bounds reject only extreme values likely to reflect a data/definition problem.
 DCF_LIMITS = {"margin": (-0.20, 0.60), "tax": (0.10, 0.30), "capex_ratio": (0.0, 0.50),
               "dep_ratio": (0.0, 0.20), "nwc_ratio": (-0.25, 0.50)}
+DCF_HARD_LIMITS = {"margin": (-1.0, 1.0), "tax": (0.0, 0.60), "capex_ratio": (0.0, 2.0),
+                   "dep_ratio": (0.0, 0.50), "nwc_ratio": (-1.0, 1.0)}
 DCF_LABELS = {"margin": "EBIT margin (3y avg)", "tax": "tax rate", "capex_ratio": "CapEx / revenue",
               "dep_ratio": "D&A / revenue", "nwc_ratio": "operating NWC / revenue"}
 FALLBACK_KEYS = {"margin": "fb_margin", "tax": "fb_tax", "capex_ratio": "fb_capex",
@@ -623,14 +662,23 @@ FALLBACK_KEYS = {"margin": "fb_margin", "tax": "fb_tax", "capex_ratio": "fb_cape
 
 
 def resolve_dcf_inputs(data, p):
+    """Use observed company ratios without clipping; fallback only for missing/extreme data."""
     values, sources = {}, {}
     for key, fb in FALLBACK_KEYS.items():
-        cv = data["company_ratios"].get(key)
-        if p["override"] or cv is None:
-            values[key], sources[key] = p[fb], "sidebar"
+        cv = safe_float(data.get("company_ratios", {}).get(key))
+        fallback = safe_float(p.get(fb))
+        if fallback is None or not (DCF_HARD_LIMITS[key][0] <= fallback <= DCF_HARD_LIMITS[key][1]):
+            raise ValueError(f"invalid sidebar fallback for {DCF_LABELS[key]}")
+        if p["override"]:
+            values[key], sources[key] = fallback, "sidebar override"
+        elif cv is None:
+            values[key], sources[key] = fallback, "sidebar fallback (company data missing)"
+        elif not (DCF_HARD_LIMITS[key][0] <= cv <= DCF_HARD_LIMITS[key][1]):
+            values[key], sources[key] = fallback, "sidebar fallback (company ratio outside hard bounds)"
         else:
-            values[key] = clamp(cv, *DCF_LIMITS[key])
-            sources[key] = "company (clipped)" if values[key] != cv else "company"
+            values[key] = cv
+            outside_soft = not (DCF_LIMITS[key][0] <= cv <= DCF_LIMITS[key][1])
+            sources[key] = "company (outside usual range)" if outside_soft else "company"
     return values, sources
 
 
@@ -670,12 +718,16 @@ def analyze_company(data, p):
     warnings = []
     if warnings_note:
         warnings.append(warnings_note)
+    if data.get("price_source") != "Yahoo current/regular market price":
+        warnings.append(f"Current quote unavailable; using {data.get('price_source', 'an unverified price fallback')}. Verify the quote timestamp before comparing valuation with market price.")
     if data.get("shares_source") != "Yahoo current shares outstanding":
         warnings.append(f"Current shares outstanding unavailable; using {data.get('shares_source', 'an unverified fallback')}. Per-share values and market capitalization may be unreliable.")
     if data.get("beta_source") != "Yahoo beta" or data.get("beta") is None or not (0 <= data.get("beta", 1.0) <= 3.0):
         warnings.append("Yahoo beta is missing or outside the supported 0–3 range; CAPM uses a beta of 1.0. Review cost of equity.")
     elif p["use_capm"] and data.get("beta") < 0.60:
         warnings.append(f"Low Yahoo beta ({data['beta']:.2f}) produces a relatively low CAPM cost of equity; compare with a normalized/industry beta as a sensitivity case.")
+    if p["use_capm"] and ke < 0.07:
+        warnings.append(f"Cost of equity is low at {ke:.1%}; valuation is sensitive to beta and the equity-risk premium. Review higher discount-rate scenarios before relying on the estimate.")
     if data.get("roe_source") == "Yahoo-reported ROE fallback":
         warnings.append("Historical ROE could not be reconstructed from reported balance-sheet history; using Yahoo-reported ROE as a fallback. Verify the equity denominator before relying on RI.")
     if data.get("payout_ratio") is None:
@@ -699,11 +751,17 @@ def analyze_company(data, p):
     rd = [v for v in (data.get("rd") or []) if v is not None and v > 0]
     if p["capitalize_rd"] and len(rd) >= 2 and eq0 and eq1 and ni_adj is not None:
         life, tx = 5, data["effective_tax_rate"] if data["effective_tax_rate"] is not None else 0.21
-        # straight-line amortization over `life` years; only the years Yahoo reports (usually 3-4) are available
-        a0 = sum(v * max(0.0, 1 - (k + 0.5) / life) for k, v in enumerate(rd)) * (1 - tx)
-        a1 = sum(v * max(0.0, 1 - (k - 0.5) / life) for k, v in enumerate(rd) if k >= 1) * (1 - tx)
+        # Yahoo annual statements are normally newest-first. Treat current-year R&D as
+        # an asset at year-end, amortize older vintages straight-line, and construct the
+        # prior-year asset without including current-year spend. With only 3-4 years of
+        # Yahoo history this is necessarily a partial-capitalization approximation.
+        current_asset = sum(v * max(0.0, 1 - k / life) for k, v in enumerate(rd[:life]))
+        prior_vintages = rd[1:life + 1]
+        prior_asset = sum(v * max(0.0, 1 - k / life) for k, v in enumerate(prior_vintages))
         amort0 = sum(rd[k] / life for k in range(1, min(len(rd), life + 1)))
-        eq0, eq1, ni_adj, adjusted = eq0 + a0, eq1 + a1, ni_adj + (rd[0] - amort0) * (1 - tx), True
+        a0, a1 = current_asset * (1 - tx), prior_asset * (1 - tx)
+        eq0, eq1 = eq0 + a0, eq1 + a1
+        ni_adj, adjusted = ni_adj + (rd[0] - amort0) * (1 - tx), True
         warnings.append("RI capitalizes R&D (5-year life, after tax) into book equity and earnings; approximate, based on the R&D years Yahoo reports.")
     ri_data = data
     if adjusted:
@@ -723,6 +781,10 @@ def analyze_company(data, p):
                         + (" Adjusted book is negative or missing; untick the tangible-book option to use reported book." if ri_data is not data else ""))
 
     ri_valid = base is not None
+    if data.get("roe_source") == "Yahoo-reported ROE fallback" and base is not None:
+        ri_valid = False
+        implied_omega = None
+        warnings.append("RI disabled: historical ROE could not be reconstructed from balance-sheet history. Yahoo-reported ROE is shown for context but is not sufficient to validate the RI forecast.")
     if base and base.get("roe_was_clipped"):
         ri_valid = False
         implied_omega = None
@@ -733,14 +795,17 @@ def analyze_company(data, p):
     eq_rep = y0["equity"]
     common_equity_available = "Gross Minority Interest" not in str(y0.get("equity_source", ""))
     pb_rep = data["price"] * data["shares"] / eq_rep if common_equity_available and eq_rep and eq_rep > 0 else NAN
+    ri_eq0 = ri_data["years"][0].get("equity") if ri_data.get("years") else None
+    ri_pb = data["price"] * data["shares"] / ri_eq0 if common_equity_available and ri_eq0 and ri_eq0 > 0 else NAN
     if not common_equity_available:
         warnings.append("Only total equity including minority interest is available; P/B and FLEV are suppressed and RI is disabled because common-equity data is not comparable.")
-    roe_rep = data["roe_hist"] if data.get("roe_hist") is not None else (base["historical_roe"] if base else NAN)
-    if ri_valid and (pb_rep > p["max_pb"] or roe_rep > p["max_roe"]):
+    roe_rep = ri_data.get("roe_hist") if ri_data.get("roe_hist") is not None else (base["historical_roe"] if base else NAN)
+    if ri_valid and (not pd.notna(ri_pb) or ri_pb > p["max_pb"] or not pd.notna(roe_rep) or roe_rep > p["max_roe"]):
         ri_valid, implied_omega = False, None
         warnings.append(
-            f"RI not meaningful: P/B {pb_rep:.1f}x and ROE {roe_rep:.0%} exceed limits. "
-            "Book equity is too small relative to earnings power (buybacks, expensed intangibles); verdict uses DCF only."
+            f"RI not meaningful: adjusted RI P/B is {ri_pb:.1f}x and RI ROE is {roe_rep:.0%}; "
+            f"the configured limits are P/B ≤ {p['max_pb']:.1f}x and ROE ≤ {p['max_roe']:.0%}. "
+            "High P/B or extreme ROE can make book-value-based RI unstable; verdict uses DCF only."
         )
 
     dcf_inputs, dcf_sources = resolve_dcf_inputs(data, p)
@@ -751,10 +816,17 @@ def analyze_company(data, p):
     latest_margin = (data["ebit"] / data["revenue"] if data.get("ebit") is not None and data.get("revenue") else None)
     # In growth mode, start at the available multi-year average and fade toward the latest
     # margin; do not assume the latest peak/trough margin persists unchanged for 15 years.
-    if is_growth and not p["override"] and dcf_inputs.get("margin") is None and latest_margin is not None:
-        dcf_inputs["margin"] = clamp(latest_margin, *DCF_LIMITS["margin"])
+    if is_growth and not p["override"] and dcf_sources.get("margin", "").startswith("sidebar fallback") and latest_margin is not None:
+        # If the 3-year average is missing, use latest reported margin only if within hard bounds.
+        if DCF_HARD_LIMITS["margin"][0] <= latest_margin <= DCF_HARD_LIMITS["margin"][1]:
+            dcf_inputs["margin"] = latest_margin
+            dcf_sources["margin"] = "latest company margin (fallback)"
     margin_end_base = latest_margin if is_growth and not p["override"] and latest_margin is not None else dcf_inputs["margin"]
-    dcf_inputs["margin_end"] = clamp(margin_end_base + (p["margin_expansion"] if is_growth else 0.0), -0.20, 0.60)
+    proposed_margin_end = margin_end_base + (p["margin_expansion"] if is_growth else 0.0)
+    if not (DCF_HARD_LIMITS["margin"][0] <= proposed_margin_end <= DCF_HARD_LIMITS["margin"][1]):
+        warnings.append("Forecast endpoint EBIT margin would exceed hard bounds; endpoint falls back to the starting DCF margin. Review the latest margin and margin-expansion assumption.")
+        proposed_margin_end = dcf_inputs["margin"]
+    dcf_inputs["margin_end"] = proposed_margin_end
     dcf_inputs["term_roic"] = clamp(rnoa if rnoa is not None else lo + 0.02, lo, hi)
     dcf = dcf_valuation(data, wacc, g_path, g_term, **dcf_inputs)
     implied_g = implied_start_growth(data, wacc, g_term, years, dcf_inputs)
@@ -762,9 +834,9 @@ def analyze_company(data, p):
 
     def scenario_vp(g_mult, g_add, margin_add, roic_add):
         try:
-            gs = clamp((g0 * g_mult if g0 > 0 else g0) + g_add, -0.10, 0.30)
+            gs = clamp((g0 * g_mult if g0 > 0 else g0) + g_add, -0.10, 0.50)
             inp = dict(dcf_inputs)
-            inp["margin_end"] = clamp(inp["margin_end"] + margin_add, -0.20, 0.60)
+            inp["margin_end"] = clamp(inp["margin_end"] + margin_add, *DCF_HARD_LIMITS["margin"])
             inp["term_roic"] = clamp(inp["term_roic"] + roic_add, lo, max(hi, lo + 0.15))
             v = dcf_valuation(data, wacc, growth_path(gs, g_term, years), g_term, **inp)["V/P"]
             return v if v > 0 else NAN
@@ -792,7 +864,7 @@ def analyze_company(data, p):
         warnings.append("FCF yield above 20%: check for a spin-off, one-off cash flow or data mismatch.")
     m_avg = data["company_ratios"].get("margin")
     if m_avg and m_avg > 0 and abs(data["ebit"] / data["revenue"] / m_avg - 1) > 0.40:
-        warnings.append("Latest EBIT margin differs >40% from the 3-year average: cyclical or volatile earnings; DCF uses the average.")
+        warnings.append("Latest EBIT margin differs >40% from the 3-year average: earnings may be cyclical or volatile. DCF starts from the average and fades toward the latest margin in growth mode; review the margin path.")
 
     if data.get("effective_tax_rate") is None:
         warnings.append("Effective tax rate unavailable: DCF uses its configured tax fallback, while WACC's after-tax debt shield uses a separate 21% fallback. Review both assumptions.")
@@ -802,12 +874,24 @@ def analyze_company(data, p):
         for k, source in dcf_sources.items():
             if source == "sidebar":
                 warnings.append(f"Company {DCF_LABELS[k]} unavailable; DCF uses the sidebar fallback.")
-            elif source == "company (clipped)":
-                warnings.append(f"Company {DCF_LABELS[k]} was outside the supported range and was clipped to the model limit.")
+            elif source == "company (outside usual range)":
+                warnings.append(f"Company {DCF_LABELS[k]} is {dcf_inputs[k]:.1%}, outside the usual diagnostic range {DCF_LIMITS[k][0]:.1%} to {DCF_LIMITS[k][1]:.1%}; the observed ratio is used without clipping. Verify the statement line items and consider a sensitivity case.")
+            elif source == "sidebar fallback (company ratio outside hard bounds)":
+                warnings.append(f"Company {DCF_LABELS[k]} was outside hard safety bounds; DCF uses the sidebar fallback instead of the reported ratio. Investigate the underlying data before relying on the estimate.")
+            elif source == "sidebar fallback (company data missing)":
+                warnings.append(f"Company {DCF_LABELS[k]} unavailable; DCF uses the sidebar fallback.")
+            elif source == "latest company margin (fallback)":
+                warnings.append("Three-year average EBIT margin is unavailable; DCF uses the latest reported EBIT margin as a fallback.")
     if p["use_capm"]:
         warnings.append("WACC uses reported/book debt as a proxy for market-value debt and the configured cost of debt; market-value debt and credit spreads are not available from these Yahoo summary fields.")
     if dcf_inputs["margin"] < 0.03:
         warnings.append("Thin EBIT margin: DCF is highly sensitive to small margin changes.")
+    if any(row["Net Investment"] < 0 for row in dcf["forecast"]):
+        warnings.append("At least one forecast year has negative net investment (CapEx − D&A + change in operating NWC), boosting FCFF. Verify whether the cash release or low reinvestment is sustainable.")
+    if any(row["FCFF"] < 0 for row in dcf["forecast"]):
+        warnings.append("At least one forecast year has negative FCFF. The DCF may still be mathematically valid, but check the transition to positive terminal cash flow.")
+    if dcf["term_roic"] <= wacc:
+        warnings.append(f"Terminal ROIC ({dcf['term_roic']:.1%}) is at or below WACC ({wacc:.1%}); terminal growth creates little or negative economic value. Review the terminal return assumption.")
     if dcf["terminal_pct"] is not None and dcf["terminal_pct"] > 0.65:
         warnings.append(
             f"Present value of terminal value is {dcf['terminal_pct']:.0%} of enterprise value; "
@@ -821,14 +905,71 @@ def analyze_company(data, p):
         if gap >= 0.50:
             warnings.append(f"Model disagreement: DCF and RI values differ by {gap:.0%} of the higher estimate. Review margins, reinvestment, book equity, payout and terminal assumptions; values are not averaged.")
 
+    # Keep DCF estimates visible for exploration, but do not let a positive number qualify a
+    # candidate when a core input is substituted/clipped or the equity bridge is incomplete.
+    beta_is_usable = (not p["use_capm"]) or (
+        data.get("beta_source") == "Yahoo beta" and data.get("beta") is not None
+        and 0 <= data.get("beta") <= 3
+    )
+    shares_are_current = data.get("shares_source") == "Yahoo current shares outstanding"
+    price_is_current = data.get("price_source") == "Yahoo current/regular market price"
+    minority_is_known = y0.get("minority") is not None
+    growth_is_unclipped = warnings_note is None and not (p["use_company_growth"] and data.get("rev_cagr") is None)
+    dcf_inputs_are_company_reported = all(source == "company" for source in dcf_sources.values())
+    dcf_reliable = bool(
+        dcf_ok and beta_is_usable and shares_are_current and price_is_current and minority_is_known
+        and growth_is_unclipped and dcf_inputs_are_company_reported
+    )
+    if dcf_ok and not dcf_reliable:
+        warnings.append("DCF is provisional, not screening-grade: at least one core input is clipped, substituted, unusual, or unavailable. It is displayed for analysis but cannot qualify the stock as a candidate; review the input warnings.")
+
     def ri(res, key):
         return res[key] if (ri_valid and res is not None) else NAN
+
+    # A valuation can pass the numeric thresholds and still be too assumption-heavy
+    # for an automatic candidate label. Keep this gate explicit and visible.
+    quality_flags = []
+    if not dcf_reliable:
+        quality_flags.append("DCF inputs or equity bridge are not screening-grade")
+    if not (DCF_LIMITS["margin"][0] <= dcf_inputs["margin_end"] <= DCF_LIMITS["margin"][1]):
+        quality_flags.append("forecast endpoint margin is outside the usual range")
+    if data.get("price_source") != "Yahoo current/regular market price":
+        quality_flags.append("fallback market quote")
+    if not data.get("currency") or data.get("currency") == "unknown":
+        quality_flags.append("security currency unavailable")
+    if data.get("shares_source") != "Yahoo current shares outstanding":
+        quality_flags.append("fallback share count")
+    if data.get("roe_source") == "Yahoo-reported ROE fallback":
+        quality_flags.append("fallback ROE")
+    if not ri_valid:
+        quality_flags.append("RI valuation unavailable or invalid")
+    if any(str(src).startswith("sidebar fallback") for src in dcf_sources.values()):
+        quality_flags.append("one or more DCF inputs use a fallback")
+    if any(src == "company (outside usual range)" for src in dcf_sources.values()):
+        quality_flags.append("one or more company ratios are outside usual ranges")
+    if dcf["terminal_pct"] is not None and dcf["terminal_pct"] > 0.65:
+        quality_flags.append("DCF terminal value exceeds 65% of enterprise value")
+    if any(row["Net Investment"] < 0 or row["FCFF"] < 0 for row in dcf["forecast"]):
+        quality_flags.append("forecast contains negative net investment or FCFF")
+    if any("Revenue changed >30%" in w or "Latest EBIT margin differs >40%" in w for w in warnings):
+        quality_flags.append("materially unusual operating history")
+    if any("Model disagreement" in w for w in warnings):
+        quality_flags.append("DCF and RI materially disagree")
+    if dcf_ok and not dcf_reliable:
+        quality_flags.append("DCF core inputs are provisional")
+    if p["use_capm"] and ke < 0.07:
+        quality_flags.append("low cost-of-equity assumption")
+    valuation_quality = "REVIEW" if quality_flags else "OK"
+    if quality_flags:
+        warnings.append("Valuation quality gate: automatic candidate status is withheld pending review of " + ", ".join(quality_flags) + ".")
 
     eq0 = y0["equity"]
     return {
         "Ticker": data["ticker"],
+        "Currency": data.get("currency", "unknown"),
         "Price": data["price"],
         "P/B": data["price"] * data["shares"] / eq0 if common_equity_available and eq0 and eq0 > 0 else NAN,
+        "RI P/B": ri_pb,
         "ROE": data.get("roe_hist") if data.get("roe_hist") is not None else (base["historical_roe"] if base else NAN),
         "RI ROE Input": base["historical_roe"] if base else NAN,
         "RI ROE Applied": base["roe_base_used"] if base else NAN,
@@ -846,6 +987,8 @@ def analyze_company(data, p):
         "Spread": operating["spread"],
         "Accruals": operating["accruals"],
         "RI Valid": ri_valid,
+        "DCF Reliable": dcf_reliable,
+        "Valuation Quality": valuation_quality,
         "RI Value": ri(base, "value_per_share"),
         "RI V/P": ri(base, "V/P"),
         "RI Conservative Value": ri(cons, "value_per_share"),
@@ -854,16 +997,17 @@ def analyze_company(data, p):
         "DCF V/P": dcf["V/P"] if dcf_ok else NAN,
         "DCF Bear V/P": bear_vp,
         "DCF Bull V/P": bull_vp,
-        "Net Debt ($B)": dcf["net_debt"] / 1e9,
+        "Net Debt (B)": dcf["net_debt"] / 1e9,
         "Shares Outstanding": data["shares"],
-        "RI Terminal Value Share": base["terminal_pct"] if base else NAN,
-        "RI Terminal ROE": base["terminal_roe"] if base else NAN,
-        "RI Terminal Payout": base["terminal_payout_ratio"] if base else NAN,
+        "RI Terminal Value Share": base["terminal_pct"] if ri_valid and base else NAN,
+        "RI Terminal ROE": base["terminal_roe"] if ri_valid and base else NAN,
+        "RI Terminal Payout": base["terminal_payout_ratio"] if ri_valid and base else NAN,
         "DCF Terminal Value Share": dcf["terminal_pct"],
         "DCF Terminal Growth": g_term,
         "DCF Terminal ROIC": dcf["term_roic"],
         "warnings": warnings,
-        "_base": base, "_dcf": dcf, "_dcf_inputs": dcf_inputs, "_dcf_sources": dcf_sources,
+        "_currency": data.get("currency", "unknown"), "_price_source": data.get("price_source", "unavailable"),
+        "_base": base if ri_valid else None, "_dcf": dcf, "_dcf_inputs": dcf_inputs, "_dcf_sources": dcf_sources,
         "_data": ri_data, "_years": years, "_g0": g0, "_ke": ke, "_wacc": wacc,
     }
 
@@ -922,11 +1066,11 @@ with st.sidebar:
     st.header("DCF")
     dcf_override = st.checkbox("Use sidebar ratios for all companies", value=False,
                                help="Off: each company's own margin, tax, CapEx, D&A and NWC ratios; sidebar values are fallbacks.")
-    fb_margin = st.number_input("EBIT margin", -0.20, 0.50, 0.15, 0.005, format="%.3f")
-    fb_tax = st.number_input("Tax rate", 0.00, 0.40, 0.21, 0.005, format="%.3f")
-    fb_capex = st.number_input("CapEx / revenue", 0.00, 0.30, 0.04, 0.005, format="%.3f")
-    fb_dep = st.number_input("D&A / revenue", 0.00, 0.20, 0.035, 0.005, format="%.3f")
-    fb_nwc = st.number_input("NWC / revenue", -0.05, 0.40, 0.05, 0.005, format="%.3f")
+    fb_margin = st.number_input("EBIT margin", -0.50, 0.80, 0.15, 0.005, format="%.3f")
+    fb_tax = st.number_input("Tax rate", 0.00, 0.60, 0.21, 0.005, format="%.3f")
+    fb_capex = st.number_input("CapEx / revenue", 0.00, 1.00, 0.04, 0.005, format="%.3f")
+    fb_dep = st.number_input("D&A / revenue", 0.00, 0.50, 0.035, 0.005, format="%.3f")
+    fb_nwc = st.number_input("NWC / revenue", -0.50, 0.80, 0.05, 0.005, format="%.3f")
     roic_cap = st.number_input("Terminal ROIC cap", 0.05, 0.50, 0.15, 0.01, format="%.2f",
                                help="Terminal reinvestment = g / ROIC. ROIC is the company's RNOA, floored at WACC+1% and capped here.")
 
@@ -984,18 +1128,24 @@ def sensitivity_table(rows, row_key, col_key, val_key):
 
 def classify_verdict(row, min_ri_vp, min_dcf_vp, min_cons_vp, strong_ri_vp, strong_max_omega, max_accruals, max_flev):
     """Conservative verdict logic: missing required quality data can never pass as a candidate."""
-    ri_ok = bool(row["RI Valid"])
+    ri_flag = row.get("RI Valid", False)
+    ri_ok = bool(ri_flag) if pd.notna(ri_flag) else False
     dcf_vp, ri_vp, cons = row["DCF V/P"], row["RI V/P"], row["RI Conservative V/P"]
     iw = row["Implied Omega"]
     if pd.isna(dcf_vp) or pd.isna(row["Accruals"]) or pd.isna(row["FLEV"]):
         return "INSUFFICIENT DATA"
-    common = dcf_vp >= min_dcf_vp and row["Accruals"] <= max_accruals and row["FLEV"] <= max_flev
+    dcf_flag = row.get("DCF Reliable", False)
+    dcf_reliable = bool(dcf_flag) if pd.notna(dcf_flag) else False
+    common = dcf_reliable and dcf_vp >= min_dcf_vp and row["Accruals"] <= max_accruals and row["FLEV"] <= max_flev
     passes = bool(
         ri_ok and common and pd.notna(ri_vp) and ri_vp >= min_ri_vp
         and pd.notna(cons) and cons >= min_cons_vp
         and pd.notna(row["ROE"]) and pd.notna(row["Cost of Equity"])
         and row["ROE"] > row["Cost of Equity"]
     )
+    quality = row.get("Valuation Quality", "REVIEW")
+    if passes and quality != "OK":
+        return "WATCH"
     if passes and ri_vp >= strong_ri_vp and pd.notna(iw) and iw <= strong_max_omega:
         return "STRONG CANDIDATE"
     if passes:
@@ -1024,26 +1174,26 @@ def render_results(df):
     c4.metric("Median DCF V/P", f"{df['DCF V/P'].median():.2f}x")
 
     st.subheader("📈 Screening results")
-    cols = ["Ticker", "Price", "P/B", "ROE", "Cost of Equity", "WACC", "Start Growth", "Market-Implied Growth",
-            "Earnings CAGR", "FCF Yield", "RNOA", "NBC", "FLEV", "Spread", "Accruals", "Implied Omega", "RI Valid",
-            "ROE Source", "RI ROE Input", "RI ROE Applied", "RI Terminal Payout", "RI Value", "RI V/P", "RI Conservative Value", "RI Conservative V/P", "DCF Value", "DCF V/P", "DCF Bear V/P", "DCF Bull V/P",
-            "Net Debt ($B)", "Shares Outstanding", "RI Terminal Value Share", "RI Terminal ROE", "DCF Terminal Value Share", "DCF Terminal Growth", "DCF Terminal ROIC", "Verdict"]
+    cols = ["Ticker", "Currency", "Price", "P/B", "RI P/B", "ROE", "Cost of Equity", "WACC", "Start Growth", "Market-Implied Growth",
+            "Earnings CAGR", "FCF Yield", "RNOA", "NBC", "FLEV", "Spread", "Accruals", "Implied Omega", "RI Valid", "DCF Reliable",
+            "ROE Source", "Valuation Quality", "RI ROE Input", "RI ROE Applied", "RI Terminal Payout", "RI Value", "RI V/P", "RI Conservative Value", "RI Conservative V/P", "DCF Value", "DCF V/P", "DCF Bear V/P", "DCF Bull V/P",
+            "Net Debt (B)", "Shares Outstanding", "RI Terminal Value Share", "RI Terminal ROE", "DCF Terminal Value Share", "DCF Terminal Growth", "DCF Terminal ROIC", "Verdict"]
     display = df[cols].copy()
     display["Market-Implied Growth"] = display["Market-Implied Growth"].replace(float("inf"), NAN)
     fmt = {
-        "Price": "${:.2f}", "P/B": "{:.2f}x", "ROE": "{:.1%}", "Cost of Equity": "{:.1%}", "WACC": "{:.1%}",
+        "Price": "{:.2f}", "P/B": "{:.2f}x", "RI P/B": "{:.2f}x", "ROE": "{:.1%}", "Cost of Equity": "{:.1%}", "WACC": "{:.1%}",
         "Start Growth": "{:.1%}", "Market-Implied Growth": "{:.1%}", "Earnings CAGR": "{:.1%}", "FCF Yield": "{:.1%}",
         "RNOA": "{:.1%}", "NBC": "{:.1%}", "FLEV": "{:.2f}", "Spread": "{:.1%}", "Accruals": "{:.1%}",
-        "Implied Omega": "{:.2f}", "RI Value": "${:,.2f}", "RI V/P": "{:.2f}x",
-        "RI Conservative Value": "${:,.2f}", "RI Conservative V/P": "{:.2f}x", "DCF Value": "${:,.2f}",
-        "DCF V/P": "{:.2f}x", "DCF Bear V/P": "{:.2f}x", "DCF Bull V/P": "{:.2f}x", "Net Debt ($B)": "${:,.1f}B", "Shares Outstanding": "{:,.0f}",
+        "Implied Omega": "{:.2f}", "RI Value": "{:,.2f}", "RI V/P": "{:.2f}x",
+        "RI Conservative Value": "{:,.2f}", "RI Conservative V/P": "{:.2f}x", "DCF Value": "{:,.2f}",
+        "DCF V/P": "{:.2f}x", "DCF Bear V/P": "{:.2f}x", "DCF Bull V/P": "{:.2f}x", "Net Debt (B)": "{:,.1f}B", "Shares Outstanding": "{:,.0f}",
         "RI ROE Input": "{:.1%}", "RI ROE Applied": "{:.1%}", "RI Terminal Payout": "{:.1%}",
         "RI Terminal Value Share": "{:.1%}", "RI Terminal ROE": "{:.1%}",
         "DCF Terminal Value Share": "{:.1%}", "DCF Terminal Growth": "{:.1%}", "DCF Terminal ROIC": "{:.1%}",
     }
     st.dataframe(style_table(display, fmt), width="stretch", hide_index=True)
-    st.caption("Market-Implied Growth = starting revenue growth the DCF needs to equal today's price. "
-               "Terminal Value Share is the present value of terminal value divided by total value; it is not the perpetual growth rate. "
+    st.caption("Price and per-share values are in each security's displayed currency. Market-Implied Growth = starting revenue growth the DCF needs to equal today's price. "
+               "Terminal Value Share is discounted terminal value divided by enterprise value for DCF and by equity value for RI; it is not the perpetual growth rate. "
                "RI columns are blank where RI is not meaningful (see warnings). Missing accruals or FLEV prevent a candidate verdict.")
 
     st.download_button("⬇️ Download results as CSV", display.to_csv(index=False).encode("utf-8"),
@@ -1058,22 +1208,24 @@ def render_results(df):
     left, right = st.columns(2)
     with left:
         st.markdown("### Valuation")
-        st.write(f"**Market price:** ${sel['Price']:.2f}")
+        currency = data.get("currency", "unknown")
+        st.write(f"**Market price:** {sel['Price']:.2f} {currency}")
         if pd.isna(sel["DCF V/P"]):
             st.write("**DCF value / V/P:** n/m (negative equity value)")
         else:
-            st.write(f"**DCF value / V/P:** ${sel['DCF Value']:.2f} / {sel['DCF V/P']:.2f}x")
+            st.write(f"**DCF value / V/P:** {sel['DCF Value']:.2f} {currency} / {sel['DCF V/P']:.2f}x")
         mig = sel["Market-Implied Growth"]
         mig_txt = ">50% (beyond model range)" if pd.notna(mig) and mig == float("inf") else (
             "≤ -10% (cheap even with shrinking sales)" if pd.notna(mig) and mig <= -0.10 else fmt_pct(mig))
         st.write(f"**Market-implied starting growth:** {mig_txt} (model start: {fmt_pct(sel['Start Growth'])})")
         st.write(f"**DCF range (bear / base / bull V/P):** {fmt_num(sel['DCF Bear V/P'])}x / {fmt_num(sel['DCF V/P'])}x / {fmt_num(sel['DCF Bull V/P'])}x")
         if sel["RI Valid"]:
-            st.write(f"**RI value / V/P:** ${sel['RI Value']:.2f} / {sel['RI V/P']:.2f}x")
-            st.write(f"**Conservative RI value / V/P:** ${sel['RI Conservative Value']:.2f} / {sel['RI Conservative V/P']:.2f}x")
+            st.write(f"**RI value / V/P:** {sel['RI Value']:.2f} {currency} / {sel['RI V/P']:.2f}x")
+            st.write(f"**Conservative RI value / V/P:** {sel['RI Conservative Value']:.2f} {currency} / {sel['RI Conservative V/P']:.2f}x")
         else:
             st.write("**RI value:** not meaningful for this company")
-        st.write(f"**P/B:** {fmt_num(sel['P/B'])}x")
+        st.write(f"**Reported P/B:** {fmt_num(sel['P/B'])}x")
+        st.write(f"**RI adjusted P/B:** {fmt_num(sel['RI P/B'])}x")
         st.write(f"**PV of terminal value / total value (DCF / RI):** {fmt_pct(sel['DCF Terminal Value Share'])} / {fmt_pct(sel['RI Terminal Value Share'])}")
         st.write(f"**DCF terminal assumptions (growth / ROIC):** {fmt_pct(sel['DCF Terminal Growth'])} / {fmt_pct(sel['DCF Terminal ROIC'])}")
     with right:
@@ -1082,12 +1234,15 @@ def render_results(df):
                               ("FLEV", "FLEV", fmt_num), ("Spread", "Spread", fmt_pct), ("Accruals", "Accruals", fmt_pct),
                               ("Cost of equity", "Cost of Equity", fmt_pct), ("WACC", "WACC", fmt_pct)]:
             st.write(f"**{label}:** {f(sel[key])}")
+        st.write(f"**DCF input quality:** {'screening-grade inputs' if sel.get('DCF Reliable', False) else 'provisional — review warnings'}")
         st.write(f"**ROE source:** {sel['ROE Source']}")
         st.write(f"**Shares source:** {data.get('shares_source', 'unavailable')}")
+        st.write(f"**Price source:** {data.get('price_source', 'unavailable')}")
+        st.write(f"**Financial currency:** {data.get('currency', 'unknown')}")
         st.write(f"**RI ROE input / applied:** {fmt_pct(sel['RI ROE Input'])} / {fmt_pct(sel['RI ROE Applied'])}")
         st.write(f"**RI terminal payout:** {fmt_pct(sel['RI Terminal Payout'])}")
         st.write(f"**Terminal ROIC used:** {fmt_pct(dcf['term_roic'])}")
-        st.write(f"**Net debt:** ${sel['Net Debt ($B)']:,.1f}B")
+        st.write(f"**Net debt:** {sel['Net Debt (B)']:,.1f} {currency}B")
 
     v = sel["Verdict"]
     if v == "STRONG CANDIDATE":
@@ -1114,15 +1269,15 @@ def render_results(df):
         read = f"The market prices in about {mig:.1%} starting growth, close to the {g0:.1%} in the model, so it looks roughly fairly priced."
     st.info("**Valuation read:** " + read)
 
-    st.markdown("### DCF bridge ($B except per share)")
+    st.markdown(f"### DCF bridge ({data.get('currency', 'unknown')} billions except per share)")
     bridge = pd.DataFrame([
         ("PV of explicit-period FCFF", dcf["pv_explicit"] / 1e9),
         ("PV of terminal value", dcf["pv_terminal"] / 1e9),
         ("Enterprise value", dcf["enterprise_value"] / 1e9),
         ("Less: net debt (incl. minority interest)", -dcf["net_debt"] / 1e9),
         ("Equity value", dcf["equity_value"] / 1e9),
-        ("Value per share ($)", dcf["value_per_share"]),
-        ("Market price ($)", sel["Price"]),
+        (f"Value per share ({data.get('currency', 'unknown')})", dcf["value_per_share"]),
+        (f"Market price ({data.get('currency', 'unknown')})", sel["Price"]),
     ], columns=["Item", "Amount"])
     st.dataframe(bridge.style.format({"Amount": "{:,.2f}"}), width="stretch", hide_index=True)
 
@@ -1182,7 +1337,9 @@ def render_results(df):
             """
 **Residual income:** value = book equity + PV of forecast residual income. This is an ROE/book-equity model; it does not use the DCF revenue-growth path to forecast earnings, so the RI forecast deliberately does not display that revenue-growth path. Forecast book equity rolls forward as beginning book + earnings − modeled payouts. RI is disabled when payout data or defensible ROE is unavailable, or when payout is outside 0–100%. In the terminal steady state, payout is set to 1 − terminal growth / terminal ROE so retained earnings imply the stated book-equity growth. This remains approximate because Yahoo summaries do not provide a full clean-surplus equity roll-forward or other-comprehensive-income reconciliation.
 
-**DCF:** FCFF = NOPAT − (CapEx − D&A + change in operating NWC). Net investment can be negative in a cash-release year; investigate whether that is sustainable rather than flooring it to zero. Revenue growth fades linearly to terminal growth; terminal FCFF = NOPAT × (1 + g) × (1 − g/ROIC), so terminal reinvestment matches growth. “DCF Terminal Value Share” is discounted terminal value divided by enterprise value, not the terminal growth rate. Missing cash or minority-interest data disables DCF rather than silently treating it as zero.
+**DCF:** FCFF = NOPAT − (CapEx − D&A + change in operating NWC). Net investment can be negative in a cash-release year; investigate whether that is sustainable rather than flooring it to zero. Revenue growth fades linearly to terminal growth; terminal FCFF = NOPAT × (1 + g) × (1 − g/ROIC), so terminal reinvestment matches growth. “DCF Terminal Value Share” is discounted terminal value divided by enterprise value, not the terminal growth rate. Missing cash or debt data disables DCF. If minority interest is not reported, the model assumes zero and warns; verify this when material.
+
+**Input-quality gate:** a DCF estimate can be displayed for exploration when an assumption is substituted, clipped, unusual, or unavailable, but it is marked provisional and cannot qualify a stock as a candidate. RI is disabled when its book-equity denominator, ROE, payout bridge, or common-equity basis is not defensible.
 
 **Gaps vs price:** a V/P well below 1 means the market is paying for more growth, higher returns or a lower discount rate than the model assumes. Market-Implied Growth shows how much growth that is.
 """
@@ -1226,10 +1383,11 @@ if run_screener:
         st.stop()
 
     df = pd.DataFrame(results)
-    skip = {"Ticker", "warnings", "RI Valid", "ROE Source"}
+    skip = {"Ticker", "Currency", "warnings", "RI Valid", "ROE Source", "Valuation Quality"}
     num_cols = [c for c in df.columns if not c.startswith("_") and c not in skip]
     df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")
-    df["RI Valid"] = df["RI Valid"].astype(bool)
+    df["RI Valid"] = df["RI Valid"].map(lambda value: bool(value) if pd.notna(value) else False)
+    df["DCF Reliable"] = df["DCF Reliable"].map(lambda value: bool(value) if pd.notna(value) else False)
     st.session_state.screen_results = df
     st.session_state.screen_assumptions = dict(P)
     render_results(df)
