@@ -160,6 +160,7 @@ def fetch_data(symbol):
             "cur_liab": pick(bs, ["Total Current Liabilities", "Current Liabilities"], col),
             "cur_debt": pick(bs, ["Current Debt And Capital Lease Obligation", "Current Debt"], col),
             "minority": pick(bs, ["Minority Interest"], col),
+            "goodwill": pick(bs, ["Goodwill And Other Intangible Assets", "Goodwill"], col),
         })
 
     def op_nwc(y):
@@ -196,6 +197,7 @@ def fetch_data(symbol):
         "beta": safe_float(info.get("beta")),
         "years": years,
         "revenue": revenue,
+        "rev_prev": pick(inc, ["Total Revenue", "Revenue"], 1),
         "ebit": ebit,
         "pretax": pretax,
         "tax": tax,
@@ -494,21 +496,34 @@ def analyze_company(data, p):
     g_path = growth_path(g0, g_term, years)
 
     warnings = []
+    ri_data = data
+    if p["tangible_book"]:
+        gw0, gw1 = y0["goodwill"], y1["goodwill"]
+        if gw0 is not None and gw1 is not None and y0["equity"] and y1["equity"]:
+            tb0, tb1 = y0["equity"] - gw0, y1["equity"] - gw1
+            ri_data = {**data, "years": [{**y0, "equity": tb0}, {**y1, "equity": tb1}],
+                       "roe_hist": (data["ni"] / tb1) if data["ni"] is not None and tb1 > 0 else None}
+            warnings.append("RI uses tangible book (goodwill and intangibles removed from equity); ROE is on tangible book.")
+        else:
+            warnings.append("Goodwill/intangibles not reported; RI uses reported book equity.")
     base = cons = implied_omega = None
     try:
-        base = residual_income_valuation(data, ke, p["omega"], g_path, g_term)
+        base = residual_income_valuation(ri_data, ke, p["omega"], g_path, g_term)
         # Conservative case: faster fade if ROE > ke, slower recovery if ROE < ke
         cons_omega = p["omega"] * 0.75 if base["historical_roe"] >= ke else min(1.0, p["omega"] * 1.25)
-        cons = residual_income_valuation(data, ke + 0.01, cons_omega, g_path, g_term)
-        implied_omega = calculate_implied_omega(data, ke, g_path, g_term)
+        cons = residual_income_valuation(ri_data, ke + 0.01, cons_omega, g_path, g_term)
+        implied_omega = calculate_implied_omega(ri_data, ke, g_path, g_term)
     except ValueError as e:
         warnings.append(f"Residual income unavailable: {e}.")
 
     ri_valid = base is not None
-    if ri_valid and (base["P/B"] > p["max_pb"] or base["historical_roe"] > p["max_roe"]):
+    eq_rep = y0["equity"]
+    pb_rep = data["price"] * data["shares"] / eq_rep if eq_rep and eq_rep > 0 else NAN
+    roe_rep = data["roe_hist"] if data.get("roe_hist") is not None else (base["historical_roe"] if base else NAN)
+    if ri_valid and (pb_rep > p["max_pb"] or roe_rep > p["max_roe"]):
         ri_valid, implied_omega = False, None
         warnings.append(
-            f"RI not meaningful: P/B {base['P/B']:.1f}x and ROE {base['historical_roe']:.0%} exceed limits. "
+            f"RI not meaningful: P/B {pb_rep:.1f}x and ROE {roe_rep:.0%} exceed limits. "
             "Book equity is too small relative to earnings power (buybacks, expensed intangibles); verdict uses DCF only."
         )
 
@@ -519,6 +534,18 @@ def analyze_company(data, p):
     dcf_inputs["term_roic"] = clamp(rnoa if rnoa is not None else lo + 0.02, lo, hi)
     dcf = dcf_valuation(data, wacc, g_path, g_term, **dcf_inputs)
     implied_g = implied_start_growth(data, wacc, g_term, years, dcf_inputs)
+    dcf_ok = dcf["value_per_share"] > 0
+    if not dcf_ok:
+        implied_g = None
+        warnings.append("DCF equity value is negative (net debt exceeds enterprise value); DCF shown as n/m.")
+    rp = data.get("rev_prev")
+    if rp and rp > 0 and abs(data["revenue"] / rp - 1) > 0.30:
+        warnings.append("Revenue changed >30% year over year: possible merger or spin-off; financials may not match the current price.")
+    if data.get("fcf_yield") is not None and data["fcf_yield"] > 0.20:
+        warnings.append("FCF yield above 20%: check for a spin-off, one-off cash flow or data mismatch.")
+    m_avg = data["company_ratios"].get("margin")
+    if m_avg and m_avg > 0 and abs(data["ebit"] / data["revenue"] / m_avg - 1) > 0.40:
+        warnings.append("Latest EBIT margin differs >40% from the 3-year average: cyclical or volatile earnings; DCF uses the average.")
 
     if not p["override"]:
         for k, s in dcf_sources.items():
@@ -558,15 +585,15 @@ def analyze_company(data, p):
         "RI V/P": ri(base, "V/P"),
         "RI Conservative Value": ri(cons, "value_per_share"),
         "RI Conservative V/P": ri(cons, "V/P"),
-        "DCF Value": dcf["value_per_share"],
-        "DCF V/P": dcf["V/P"],
+        "DCF Value": dcf["value_per_share"] if dcf_ok else NAN,
+        "DCF V/P": dcf["V/P"] if dcf_ok else NAN,
         "Net Debt ($B)": dcf["net_debt"] / 1e9,
         "Shares Outstanding": data["shares"],
         "RI Terminal %": base["terminal_pct"] if base else NAN,
         "DCF Terminal %": dcf["terminal_pct"],
         "warnings": warnings,
         "_base": base, "_dcf": dcf, "_dcf_inputs": dcf_inputs, "_dcf_sources": dcf_sources,
-        "_data": data, "_g0": g0, "_ke": ke, "_wacc": wacc,
+        "_data": ri_data, "_g0": g0, "_ke": ke, "_wacc": wacc,
     }
 
 
@@ -597,6 +624,7 @@ with st.sidebar:
     omega = st.slider("ROE persistence (ω)", 0.0, 1.0, 0.80, 0.05)
     max_pb = st.number_input("RI valid only if P/B ≤", 1.0, 100.0, 10.0, 1.0)
     max_roe = st.number_input("RI valid only if ROE ≤", 0.10, 3.00, 0.50, 0.05)
+    tangible_book = st.checkbox("RI: use tangible book (subtract goodwill & intangibles)", value=True)
 
     st.divider()
     st.header("DCF")
@@ -624,7 +652,7 @@ P = {
     "use_capm": use_capm, "rf": rf, "erp": erp, "kd": kd, "flat_ke": flat_ke, "flat_wacc": flat_wacc,
     "terminal_growth": terminal_growth, "years": forecast_years, "use_company_growth": use_company_growth,
     "max_start_growth": max_start_growth, "start_growth": start_growth_fb, "omega": omega,
-    "max_pb": max_pb, "max_roe": max_roe, "override": dcf_override, "fb_margin": fb_margin,
+    "max_pb": max_pb, "max_roe": max_roe, "tangible_book": tangible_book, "override": dcf_override, "fb_margin": fb_margin,
     "fb_tax": fb_tax, "fb_capex": fb_capex, "fb_dep": fb_dep, "fb_nwc": fb_nwc, "roic_cap": roic_cap,
 }
 
@@ -729,7 +757,10 @@ def render_results(df):
     with left:
         st.markdown("### Valuation")
         st.write(f"**Market price:** ${sel['Price']:.2f}")
-        st.write(f"**DCF value / V/P:** ${sel['DCF Value']:.2f} / {sel['DCF V/P']:.2f}x")
+        if pd.isna(sel["DCF V/P"]):
+            st.write("**DCF value / V/P:** n/m (negative equity value)")
+        else:
+            st.write(f"**DCF value / V/P:** ${sel['DCF Value']:.2f} / {sel['DCF V/P']:.2f}x")
         mig = sel["Market-Implied Growth"]
         mig_txt = ">50% (beyond model range)" if pd.notna(mig) and mig == float("inf") else (
             "≤ -10% (cheap even with shrinking sales)" if pd.notna(mig) and mig <= -0.10 else fmt_pct(mig))
