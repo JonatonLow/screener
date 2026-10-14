@@ -406,6 +406,29 @@ def discount_rates(data, p):
     return ke, wacc
 
 
+def normalized_beta_sensitivity(data, p):
+    """Return a Blume-adjusted beta and CAPM rate sensitivity without changing the base case.
+
+    This is a sensitivity reference only: the primary DCF continues to use the reported
+    Yahoo beta so the app never silently substitutes a different beta into its headline value.
+    """
+    if not p.get("use_capm", True):
+        return NAN, NAN, NAN
+    beta = data.get("beta")
+    if beta is None or not (0.0 <= beta <= 3.0):
+        return NAN, NAN, NAN
+    # Common Blume-style mean reversion toward market beta = 1.0.
+    beta_norm = 0.67 * beta + 0.33 * 1.0
+    ke_norm = p["rf"] + beta_norm * p["erp"]
+    debt = max(data["years"][0]["debt"] or 0.0, 0.0)
+    mcap = data["price"] * data["shares"]
+    w_d = debt / (debt + mcap) if (debt + mcap) > 0 else 0.0
+    tax = data.get("effective_tax_rate")
+    tax = 0.21 if tax is None else tax
+    wacc_norm = (1 - w_d) * ke_norm + w_d * p["kd"] * (1 - tax)
+    return beta_norm, ke_norm, wacc_norm
+
+
 def growth_path(start, terminal, years):
     """Revenue growth fading linearly from `start` (year 1) to `terminal` (year N)."""
     if years <= 1:
@@ -713,6 +736,7 @@ def analyze_company(data, p):
 
     operating = operating_analysis(data)
     ke, wacc = discount_rates(data, p)
+    normalized_beta, normalized_ke, normalized_wacc = normalized_beta_sensitivity(data, p)
     years, g_term = p["years"], p["terminal_growth"]
     if ke <= g_term + 0.01 or wacc <= g_term:
         raise ValueError("discount rate too close to terminal growth")
@@ -737,7 +761,7 @@ def analyze_company(data, p):
     if data.get("beta_source") != "Yahoo beta" or data.get("beta") is None or not (0 <= data.get("beta", 1.0) <= 3.0):
         warnings.append("Yahoo beta is missing or outside the supported 0–3 range; CAPM uses a beta of 1.0. Review cost of equity.")
     elif p["use_capm"] and data.get("beta") < 0.60:
-        warnings.append(f"Low Yahoo beta ({data['beta']:.2f}) produces a relatively low CAPM cost of equity; compare with a normalized/industry beta as a sensitivity case.")
+        warnings.append(f"Low Yahoo beta ({data['beta']:.2f}) produces a relatively low CAPM cost of equity. Blume-adjusted beta sensitivity is {normalized_beta:.2f} (cost of equity {normalized_ke:.1%}, WACC {normalized_wacc:.1%}); these are sensitivity rates only, not the rates used in the headline DCF. Compare with an industry beta if available.")
     if p["use_capm"] and ke < 0.07:
         warnings.append(f"Cost of equity is low at {ke:.1%}; valuation is sensitive to beta and the equity-risk premium. Review higher discount-rate scenarios before relying on the estimate.")
     if data.get("roe_source") == "Yahoo-reported ROE fallback":
@@ -757,7 +781,7 @@ def analyze_company(data, p):
                 eq0, eq1, adjusted = tangible0, tangible1, True
                 warnings.append("RI uses tangible book (goodwill and intangibles removed from equity).")
             else:
-                warnings.append("Tangible book is non-positive for the current or prior period; RI automatically falls back to reported book equity.")
+                warnings.append("Tangible book is non-positive for the current or prior period; RI uses reported book equity instead. This fallback does not override other RI validity checks.")
         else:
             warnings.append("Goodwill/intangibles not reported; RI uses reported book equity.")
     rd = [v for v in (data.get("rd") or []) if v is not None and v > 0]
@@ -1002,6 +1026,9 @@ def analyze_company(data, p):
         "ROE Source": data.get("roe_source") or "unavailable",
         "Cost of Equity": ke,
         "WACC": wacc,
+        "Normalized Beta Sensitivity": normalized_beta,
+        "Normalized Cost of Equity": normalized_ke,
+        "Normalized WACC": normalized_wacc,
         "Start Growth": g0,
         "Market-Implied Growth": implied_g,
         "Earnings CAGR": data.get("earnings_cagr"),
@@ -1452,7 +1479,7 @@ TREE = ast.parse(SOURCE.read_text(encoding="utf-8"))
 FUNCTIONS = {
     "safe_float", "clamp", "pick", "row_values", "spend", "payout_ratio_from_cashflows", "ratio", "fmt_pct", "fmt_num",
     "total_debt_for_period", "equity_row_source", "_period_years", "_cagr_between",
-    "compute_history", "operating_analysis", "discount_rates", "growth_path", "start_growth",
+    "compute_history", "operating_analysis", "discount_rates", "normalized_beta_sensitivity", "growth_path", "start_growth",
     "residual_income_valuation", "calculate_implied_omega", "dcf_valuation",
     "implied_start_growth", "resolve_dcf_inputs", "analyze_company", "should_skip_company",
     "classify_verdict",
@@ -1538,7 +1565,7 @@ class ScreenerSmokeTests(unittest.TestCase):
         result = NS["analyze_company"](data, p)
         self.assertFalse(result["RI Valid"])
         self.assertGreater(result["RI P/B"], 10.0)
-        self.assertTrue(any("automatically falls back to reported book equity" in warning for warning in result["warnings"]))
+        self.assertTrue(any("uses reported book equity instead" in warning for warning in result["warnings"]))
         self.assertTrue(any("adjusted RI P/B" in warning for warning in result["warnings"]))
 
     def test_unreliable_dcf_cannot_pass_candidate_thresholds(self):
@@ -1728,6 +1755,17 @@ class ScreenerSmokeTests(unittest.TestCase):
         fallback_out = NS["analyze_company"](fallback_data, self.model_params())
         self.assertFalse(fallback_out["DCF Reliable"])
         self.assertTrue(any("sidebar fallback" in w for w in fallback_out["warnings"]))
+
+    def test_low_beta_reports_normalized_beta_sensitivity_without_changing_base_rate(self):
+        data = self.synthetic_company(beta=0.32)
+        params = self.model_params()
+        params["rf"] = 0.04
+        params["erp"] = 0.05
+        out = NS["analyze_company"](data, params)
+        self.assertAlmostEqual(out["Normalized Beta Sensitivity"], 0.67 * 0.32 + 0.33, places=6)
+        self.assertAlmostEqual(out["Cost of Equity"], 0.04 + 0.32 * 0.05, places=6)
+        self.assertGreater(out["Normalized Cost of Equity"], out["Cost of Equity"])
+        self.assertTrue(any("Blume-adjusted beta sensitivity" in w for w in out["warnings"]))
 
     def test_low_capm_cost_of_equity_downgrades_dcf_reliability(self):
         data = self.synthetic_company(beta=0.2)
