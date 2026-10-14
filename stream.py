@@ -1,3 +1,4 @@
+
 import pandas as pd
 import streamlit as st
 import yfinance as yf
@@ -8,7 +9,7 @@ NAN = float("nan")
 # PAGE
 # ============================================================
 
-st.set_page_config(page_title=" Stock Screener", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Penman Stock Screener", page_icon="📊", layout="wide")
 st.session_state.setdefault("screen_results", None)
 st.session_state.setdefault("screen_assumptions", None)
 
@@ -74,13 +75,17 @@ def fmt_num(v):
     return "—" if v is None or pd.isna(v) else f"{v:.2f}"
 
 
-EQUITY = ["Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"]
+# Current yfinance names plus legacy Yahoo row labels used by older responses.
+EQUITY = [
+    "Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest",
+    "Total Stockholder Equity", "Total Stockholders Equity", "Total Equity",
+]
 EBIT_NAMES = ["Operating Income", "EBIT"]
 
 
 def compute_history(income, balance, cash_flow, price, shares):
     out = {"roe_hist": None, "earnings_cagr": None, "fcf_yield": None}
-    earn = row_values(income, ["Net Income Common Stockholders", "Net Income"])
+    earn = row_values(income, ["Net Income Common Stockholders", "Net Income", "Net Income From Continuing Operation Net Minority Interest", "Net Income From Continuing Operations"])
     if earn and balance is not None and not balance.empty:
         roes = []
         for i in range(min(5, len(earn), balance.shape[1] - 1)):
@@ -193,8 +198,13 @@ def fetch_data(symbol):
     capex = spend(pick(cf, ["Capital Expenditure", "Capital Expenditures"], 0))
     dep = pick(cf, ["Depreciation And Amortization", "Depreciation Amortization Depletion", "Depreciation", "Depreciation, Depletion And Amortization"], 0)
     hist = compute_history(inc, bs, cf, price, shares)
+    yahoo_roe = safe_float(info.get("returnOnEquity"))
+    roe_hist = hist["roe_hist"] if hist["roe_hist"] is not None else yahoo_roe
+    roe_source = "historical average equity" if hist["roe_hist"] is not None else (
+        "Yahoo-reported ROE fallback" if yahoo_roe is not None else None
+    )
 
-    ni_latest = pick(inc, ["Net Income Common Stockholders", "Net Income", "Net Income Including Noncontrolling Interests"], 0)
+    ni_latest = pick(inc, ["Net Income Common Stockholders", "Net Income", "Net Income Including Noncontrolling Interests", "Net Income From Continuing Operation Net Minority Interest", "Net Income From Continuing Operations"], 0)
     dividends_latest = spend(pick(cf, ["Cash Dividends Paid", "Common Stock Dividend Paid"], 0))
     buybacks_latest = spend(pick(cf, ["Repurchase Of Capital Stock", "Common Stock Payments"], 0))
     payout_ratio = None
@@ -214,7 +224,7 @@ def fetch_data(symbol):
         "pretax": pretax,
         "tax": tax,
         "interest": pick(inc, ["Interest Expense", "Interest Expense Non Operating"], 0),
-        "ni": pick(inc, ["Net Income Common Stockholders", "Net Income", "Net Income Including Noncontrolling Interests"], 0),
+        "ni": pick(inc, ["Net Income Common Stockholders", "Net Income", "Net Income Including Noncontrolling Interests", "Net Income From Continuing Operation Net Minority Interest", "Net Income From Continuing Operations"], 0),
         "cfo": pick(cf, ["Operating Cash Flow", "Total Cash From Operating Activities"], 0),
         "div": pick(cf, ["Cash Dividends Paid", "Common Stock Dividend Paid"], 0),
         "buyback": pick(cf, ["Repurchase Of Capital Stock", "Common Stock Payments"], 0),
@@ -223,7 +233,8 @@ def fetch_data(symbol):
         "diluted_shares": pick(inc, ["Diluted Average Shares", "Weighted Average Shares Diluted"], 0),
         "effective_tax_rate": etr,
         "rev_cagr": rev_cagr,
-        "roe_hist": hist["roe_hist"],
+        "roe_hist": roe_hist,
+        "roe_source": roe_source,
         "earnings_cagr": hist["earnings_cagr"],
         "fcf_yield": hist["fcf_yield"],
         "company_ratios": {
@@ -381,7 +392,7 @@ def residual_income_valuation(data, ke, omega, g_path, g_term):
         "value_per_share": vps,
         "V/P": vps / price,
         "P/B": price * shares / bv0,
-        "terminal_pct": pv_tv / equity if equity else None,
+        "terminal_pct": pv_tv / equity if equity > 0 else None,
         "forecast": forecast,
     }
 
@@ -465,7 +476,7 @@ def dcf_valuation(data, wacc, g_path, g_term, margin, tax, capex_ratio, dep_rati
     vps = equity / shares
     return {
         "net_debt": net_debt, "enterprise_value": ev, "equity_value": equity,
-        "value_per_share": vps, "V/P": vps / price, "terminal_pct": pv_tv / ev if ev else None,
+        "value_per_share": vps, "V/P": vps / price, "terminal_pct": pv_tv / ev if ev > 0 else None,
         "term_roic": term_roic, "forecast": forecast,
         "pv_explicit": pv_fcff, "pv_terminal": pv_tv, "term_fcff": term_fcff,
     }
@@ -539,6 +550,8 @@ def analyze_company(data, p):
     g_path = growth_path(g0, g_term, years)
 
     warnings = []
+    if data.get("roe_source") == "Yahoo-reported ROE fallback":
+        warnings.append("Historical ROE could not be reconstructed from reported balance-sheet history; using Yahoo-reported ROE as a fallback. Verify the equity denominator before relying on RI.")
     if data.get("payout_ratio") is None:
         warnings.append("Dividend/buyback payout data unavailable; RI book-equity bridge assumes zero payout. Treat RI as lower-confidence.")
     eq0, eq1, ni_adj = y0["equity"], y1["equity"], data["ni"]
@@ -638,8 +651,11 @@ def analyze_company(data, p):
                 warnings.append(f"Company {DCF_LABELS[k]} unavailable; DCF uses the sidebar fallback.")
     if dcf_inputs["margin"] < 0.03:
         warnings.append("Thin EBIT margin: DCF is highly sensitive to small margin changes.")
-    if dcf["terminal_pct"] and dcf["terminal_pct"] > 0.80:
-        warnings.append(f"Terminal value is {dcf['terminal_pct']:.0%} of DCF enterprise value.")
+    if dcf["terminal_pct"] is not None and dcf["terminal_pct"] > 0.80:
+        warnings.append(
+            f"Present value of terminal value is {dcf['terminal_pct']:.0%} of enterprise value; "
+            "the estimate is highly sensitive to terminal assumptions. Consider a longer explicit forecast."
+        )
     dil = data.get("diluted_shares")
     if dil and data["shares"] and abs(dil - data["shares"]) / data["shares"] > 0.05:
         warnings.append("Share count differs >5% from diluted average; per-share values may be unreliable.")
@@ -656,7 +672,7 @@ def analyze_company(data, p):
         "Ticker": data["ticker"],
         "Price": data["price"],
         "P/B": data["price"] * data["shares"] / eq0 if eq0 and eq0 > 0 else NAN,
-        "ROE": base["historical_roe"] if base else NAN,
+        "ROE": data.get("roe_hist") if data.get("roe_hist") is not None else (base["historical_roe"] if base else NAN),
         "Cost of Equity": ke,
         "WACC": wacc,
         "Start Growth": g0,
@@ -680,9 +696,11 @@ def analyze_company(data, p):
         "DCF Bull V/P": bull_vp,
         "Net Debt ($B)": dcf["net_debt"] / 1e9,
         "Shares Outstanding": data["shares"],
-        "RI Terminal %": base["terminal_pct"] if base else NAN,
+        "RI Terminal Value Share": base["terminal_pct"] if base else NAN,
         "RI Terminal ROE": base["terminal_roe"] if base else NAN,
-        "DCF Terminal %": dcf["terminal_pct"],
+        "DCF Terminal Value Share": dcf["terminal_pct"],
+        "DCF Terminal Growth": g_term,
+        "DCF Terminal ROIC": dcf["term_roic"],
         "warnings": warnings,
         "_base": base, "_dcf": dcf, "_dcf_inputs": dcf_inputs, "_dcf_sources": dcf_sources,
         "_data": ri_data, "_years": years, "_g0": g0, "_ke": ke, "_wacc": wacc,
@@ -832,7 +850,7 @@ def render_results(df):
     cols = ["Ticker", "Price", "P/B", "ROE", "Cost of Equity", "WACC", "Start Growth", "Market-Implied Growth",
             "Earnings CAGR", "FCF Yield", "RNOA", "NBC", "FLEV", "Spread", "Accruals", "Implied Omega", "RI Valid",
             "RI Value", "RI V/P", "RI Conservative Value", "RI Conservative V/P", "DCF Value", "DCF V/P", "DCF Bear V/P", "DCF Bull V/P",
-            "Net Debt ($B)", "Shares Outstanding", "RI Terminal %", "RI Terminal ROE", "DCF Terminal %", "Verdict"]
+            "Net Debt ($B)", "Shares Outstanding", "RI Terminal Value Share", "RI Terminal ROE", "DCF Terminal Value Share", "DCF Terminal Growth", "DCF Terminal ROIC", "Verdict"]
     display = df[cols].copy()
     display["Market-Implied Growth"] = display["Market-Implied Growth"].replace(float("inf"), NAN)
     fmt = {
@@ -842,10 +860,12 @@ def render_results(df):
         "Implied Omega": "{:.2f}", "RI Value": "${:,.2f}", "RI V/P": "{:.2f}x",
         "RI Conservative Value": "${:,.2f}", "RI Conservative V/P": "{:.2f}x", "DCF Value": "${:,.2f}",
         "DCF V/P": "{:.2f}x", "DCF Bear V/P": "{:.2f}x", "DCF Bull V/P": "{:.2f}x", "Net Debt ($B)": "${:,.1f}B", "Shares Outstanding": "{:,.0f}",
-        "RI Terminal %": "{:.1%}", "RI Terminal ROE": "{:.1%}", "DCF Terminal %": "{:.1%}",
+        "RI Terminal Value Share": "{:.1%}", "RI Terminal ROE": "{:.1%}",
+        "DCF Terminal Value Share": "{:.1%}", "DCF Terminal Growth": "{:.1%}", "DCF Terminal ROIC": "{:.1%}",
     }
     st.dataframe(style_table(display, fmt), width="stretch", hide_index=True)
     st.caption("Market-Implied Growth = starting revenue growth the DCF needs to equal today's price. "
+               "Terminal Value Share is the present value of terminal value divided by total value; it is not the perpetual growth rate. "
                "RI columns are blank where RI is not meaningful (see warnings).")
 
     st.download_button("⬇️ Download results as CSV", display.to_csv(index=False).encode("utf-8"),
@@ -876,7 +896,8 @@ def render_results(df):
         else:
             st.write("**RI value:** not meaningful for this company")
         st.write(f"**P/B:** {fmt_num(sel['P/B'])}x")
-        st.write(f"**Terminal share (DCF / RI):** {fmt_pct(sel['DCF Terminal %'])} / {fmt_pct(sel['RI Terminal %'])}")
+        st.write(f"**PV of terminal value / total value (DCF / RI):** {fmt_pct(sel['DCF Terminal Value Share'])} / {fmt_pct(sel['RI Terminal Value Share'])}")
+        st.write(f"**DCF terminal assumptions (growth / ROIC):** {fmt_pct(sel['DCF Terminal Growth'])} / {fmt_pct(sel['DCF Terminal ROIC'])}")
     with right:
         st.markdown("### Diagnostics")
         for label, key, f in [("ROE", "ROE", fmt_pct), ("RNOA", "RNOA", fmt_pct), ("NBC", "NBC", fmt_pct),
@@ -979,7 +1000,7 @@ def render_results(df):
             """
 **Residual income:** value = book equity + PV of forecast residual income. Forecast book equity rolls forward as beginning book + earnings − modeled payouts; payouts are estimated from the latest reported dividends and buybacks when available. ROE fades toward the cost of equity at rate ω. Missing payout data lowers confidence; clean-surplus reconciliation is approximate because Yahoo's summarized statements do not provide a complete equity roll-forward.
 
-**DCF:** FCFF = NOPAT − (CapEx − D&A + change in operating NWC). Net investment can be negative in a cash-release year; investigate whether that is sustainable rather than flooring it to zero. Revenue growth fades linearly to terminal growth; terminal FCFF = NOPAT × (1 − g/ROIC), so terminal reinvestment matches growth.
+**DCF:** FCFF = NOPAT − (CapEx − D&A + change in operating NWC). Net investment can be negative in a cash-release year; investigate whether that is sustainable rather than flooring it to zero. Revenue growth fades linearly to terminal growth; terminal FCFF = NOPAT × (1 + g) × (1 − g/ROIC), so terminal reinvestment matches growth. “DCF Terminal Value Share” is discounted terminal value divided by enterprise value, not the terminal growth rate.
 
 **Gaps vs price:** a V/P well below 1 means the market is paying for more growth, higher returns or a lower discount rate than the model assumes. Market-Implied Growth shows how much growth that is.
 """
