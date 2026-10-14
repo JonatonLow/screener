@@ -10,8 +10,8 @@ import yfinance as yf
 
 if "screen_results" not in st.session_state:
     st.session_state.screen_results = None
-if "last_assumptions" not in st.session_state:
-    st.session_state.last_assumptions = None
+if "screen_assumptions" not in st.session_state:
+    st.session_state.screen_assumptions = None
 
 st.set_page_config(
     page_title="Penman Stock Screener",
@@ -41,7 +41,6 @@ st.caption(
 # HELPERS
 # ============================================================
 
-
 def safe_float(value):
     try:
         if value is None or pd.isna(value):
@@ -52,6 +51,10 @@ def safe_float(value):
 
 
 def pick(df, names, col=0):
+    """
+    Find the first available accounting item from a list of
+    possible Yahoo Finance row names.
+    """
     if df is None or df.empty:
         return None
     if col >= df.shape[1]:
@@ -84,6 +87,9 @@ def clamp(value, lower, upper):
 
 
 def as_positive_spending(value):
+    """
+    Convert negative reported capital expenditure into positive spending.
+    """
     if value is None:
         return None
     value = safe_float(value)
@@ -96,43 +102,49 @@ def net_debt_from_balance_sheet(year):
     debt = year.get("debt")
     cash = year.get("cash")
     if debt is None:
-        raise ValueError("Total debt is unavailable; net debt cannot be calculated.")
+        raise ValueError("total debt unavailable; cannot compute net debt")
     if cash is None:
-        raise ValueError("Cash is unavailable; net debt cannot be calculated.")
-    return (debt or 0.0) - (cash or 0.0)
+        cash = 0.0
+    return debt - cash
 
 
-def median(values):
-    values = [v for v in values if v is not None and pd.notna(v)]
-    if not values:
-        return None
-    return float(pd.Series(values).median())
+def compute_history(income, balance, cash_flow, price, shares):
+    """Historical ratios computed once from the downloaded statements (no network)."""
+    result = {"roe_hist": None, "earnings_cagr": None, "fcf_yield": None}
 
+    earnings_row = None
+    for name in ("Net Income Common Stockholders", "Net Income"):
+        if income is not None and not income.empty and name in income.index:
+            earnings_row = income.loc[name]
+            break
 
-def assumptions_snapshot():
-    return {
-        "required_return": required_return,
-        "omega": omega,
-        "terminal_growth": terminal_growth,
-        "wacc": wacc,
-        "dcf_terminal_growth": dcf_terminal_growth,
-        "dcf_revenue_growth": dcf_revenue_growth,
-        "dcf_operating_margin": dcf_operating_margin,
-        "dcf_tax_rate": dcf_tax_rate,
-        "dcf_capex_ratio": dcf_capex_ratio,
-        "dcf_dep_ratio": dcf_dep_ratio,
-        "dcf_nwc_ratio": dcf_nwc_ratio,
-        "dcf_forecast_years": dcf_forecast_years,
-        "override_dcf_assumptions": override_dcf_assumptions,
-        "strong_ri_vp": strong_ri_vp,
-        "strong_dcf_vp": strong_dcf_vp,
-        "strong_omega_max": strong_omega_max,
-        "min_ri_vp": min_ri_vp,
-        "min_dcf_vp": min_dcf_vp,
-        "min_conservative_vp": min_conservative_vp,
-        "max_accruals": max_accruals,
-        "max_flev": max_flev,
-    }
+    if earnings_row is not None and balance is not None and not balance.empty:
+        earnings = [safe_float(earnings_row.iloc[i]) for i in range(len(earnings_row))]
+        equity_names = ["Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"]
+
+        roe_values = []
+        for i in range(min(5, len(earnings), max(0, balance.shape[1] - 1))):
+            equity_previous = pick(balance, equity_names, i + 1)
+            earnings_value = earnings[i]
+            if earnings_value is not None and equity_previous is not None and equity_previous > 0:
+                roe_values.append(earnings_value / equity_previous)
+        if roe_values:
+            result["roe_hist"] = float(pd.Series(roe_values).median())
+
+        valid_earnings = [(i, v) for i, v in enumerate(earnings) if v is not None and v > 0]
+        if len(valid_earnings) >= 3:
+            newest_index, newest = valid_earnings[0]
+            oldest_index, oldest = valid_earnings[-1]
+            span = oldest_index - newest_index
+            if span > 0:
+                result["earnings_cagr"] = (newest / oldest) ** (1 / span) - 1
+
+    cfo = pick(cash_flow, ["Operating Cash Flow", "Total Cash From Operating Activities"], 0)
+    capex = as_positive_spending(pick(cash_flow, ["Capital Expenditure", "Capital Expenditures"], 0))
+    if cfo is not None and capex is not None and price and shares and price > 0 and shares > 0:
+        result["fcf_yield"] = (cfo - capex) / (price * shares)
+
+    return result
 
 
 # ============================================================
@@ -163,27 +175,30 @@ def fetch_data(symbol):
     except Exception:
         cash_flow = pd.DataFrame()
 
-    try:
-        history = ticker.history(period="5d")
-        if not history.empty:
-            price = float(history["Close"].dropna().iloc[-1])
-        else:
-            price = info.get("currentPrice") or info.get("regularMarketPrice")
-    except Exception:
-        price = info.get("currentPrice") or info.get("regularMarketPrice")
-
+    price = info.get("currentPrice") or info.get("regularMarketPrice")
     if price is None:
-        raise ValueError(f"{symbol}: missing price data.")
-    if balance_sheet.empty or income_statement.empty or cash_flow.empty:
-        raise ValueError(f"{symbol}: missing financial statements from Yahoo Finance.")
+        try:
+            history = ticker.history(period="5d")
+            if not history.empty:
+                price = float(history["Close"].dropna().iloc[-1])
+        except Exception:
+            pass
 
     shares = info.get("sharesOutstanding")
     if shares is None:
         shares = pick(balance_sheet, ["Ordinary Shares Number", "Share Issued", "Common Stock Shares Outstanding"], 0)
     if shares is None:
         shares = pick(income_statement, ["Weighted Average Shares Basic", "Weighted Average Shares Diluted"], 0)
-    if shares is None:
-        raise ValueError(f"{symbol}: missing shares outstanding.")
+
+    # Raise (instead of returning blanks) so a failed download is NOT cached.
+    if (
+        price is None
+        or balance_sheet is None
+        or balance_sheet.empty
+        or income_statement is None
+        or income_statement.empty
+    ):
+        raise ValueError("Yahoo data unavailable (possibly rate-limited); try again in a few minutes")
 
     years = []
     for col in [0, 1]:
@@ -207,9 +222,7 @@ def fetch_data(symbol):
 
     cfo = pick(cash_flow, ["Operating Cash Flow", "Total Cash From Operating Activities"], 0)
     dividends = pick(cash_flow, ["Cash Dividends Paid", "Common Stock Dividend Paid"], 0)
-    buyback_raw = pick(cash_flow, ["Repurchase Of Capital Stock", "Repurchases Of Capital Stock", "Purchase Of Capital Stock", "Common Stock Repurchased"], 0)
-    buyback = as_positive_spending(buyback_raw)
-    depreciation = pick(cash_flow, ["Depreciation", "Depreciation And Amortization", "D&A", "Depreciation, Depletion And Amortization"], 0)
+    depreciation = pick(cash_flow, ["Depreciation And Amortization", "Depreciation Amortization Depletion", "Depreciation", "D&A", "Depreciation, Depletion And Amortization"], 0)
     capex_raw = pick(cash_flow, ["Capital Expenditure", "Capital Expenditures"], 0)
     capex = as_positive_spending(capex_raw)
 
@@ -236,53 +249,15 @@ def fetch_data(symbol):
         if current_nwc is not None and prior_nwc is not None:
             fcff_base = fcff_base - (current_nwc - prior_nwc)
 
-    # Historical metrics are computed once here to avoid network calls in valuation functions.
-    roe_values = []
-    earnings_row = None
-    for name in ("Net Income Common Stockholders", "Net Income"):
-        if name in income_statement.index:
-            earnings_row = income_statement.loc[name]
-            break
-    if earnings_row is not None:
-        for i in range(min(5, len(earnings_row))):
-            earnings_value = safe_float(earnings_row.iloc[i])
-            equity_previous = pick(balance_sheet, ["Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"], i + 1)
-            if earnings_value is not None and equity_previous is not None and equity_previous > 0:
-                roe_values.append(earnings_value / equity_previous)
+    history = compute_history(income_statement, balance_sheet, cash_flow, price, shares)
 
-    historical_roe = median(roe_values)
+    buyback = pick(cash_flow, ["Repurchase Of Capital Stock", "Common Stock Payments"], 0)
+    diluted_shares = pick(income_statement, ["Diluted Average Shares", "Weighted Average Shares Diluted"], 0)
 
-    valid_earnings = []
-    if earnings_row is not None:
-        for i in range(len(earnings_row)):
-            value = safe_float(earnings_row.iloc[i])
-            if value is not None and value > 0:
-                valid_earnings.append((i, value))
-
-    earnings_cagr = None
-    if len(valid_earnings) >= 2:
-        newest_index, newest = valid_earnings[0]
-        oldest_index, oldest = valid_earnings[-1]
-        span = newest_index - oldest_index
-        if span > 0:
-            earnings_cagr = (newest / oldest) ** (1 / span) - 1
-
-    fcf_yield = None
-    if cfo is not None and capex is not None and price > 0 and shares > 0:
-        free_cash_flow = cfo - capex
-        market_cap = price * shares
-        fcf_yield = free_cash_flow / market_cap
-
-    latest_revenue = revenue if revenue is not None and revenue > 0 else None
-    dcf_margin_default = None
-    dcf_capex_default = None
-    dcf_dep_default = None
-    dcf_nwc_default = None
-    if latest_revenue is not None:
-        dcf_margin_default = clamp((ebit / latest_revenue) if ebit is not None else None, -0.20, 0.50)
-        dcf_capex_default = clamp((capex / latest_revenue) if capex is not None else None, 0.00, 0.30)
-        dcf_dep_default = clamp((depreciation / latest_revenue) if depreciation is not None else None, 0.00, 0.20)
-        dcf_nwc_default = clamp((current_nwc / latest_revenue) if current_nwc is not None else None, 0.00, 0.60)
+    def ratio(numerator, denominator):
+        if numerator is None or denominator is None or denominator <= 0:
+            return None
+        return numerator / denominator
 
     return {
         "ticker": symbol.upper(),
@@ -298,7 +273,6 @@ def fetch_data(symbol):
         "ni": safe_float(net_income),
         "cfo": safe_float(cfo),
         "div": safe_float(dividends),
-        "buyback": safe_float(buyback),
         "depreciation": safe_float(depreciation),
         "capex": safe_float(capex),
         "nwc": safe_float(current_nwc),
@@ -309,27 +283,15 @@ def fetch_data(symbol):
         "prior_operating_assets": safe_float(prior_operating_assets),
         "fcff_base": safe_float(fcff_base),
         "effective_tax_rate": safe_float(effective_tax_rate),
-        "historical_roe": safe_float(historical_roe),
-        "roe_5y": safe_float(historical_roe),
-        "earnings_cagr": safe_float(earnings_cagr),
-        "fcf_yield": safe_float(fcf_yield),
-        "dcf_ebit_margin_default": safe_float(dcf_margin_default),
-        "dcf_capex_ratio_default": safe_float(dcf_capex_default),
-        "dcf_dep_ratio_default": safe_float(dcf_dep_default),
-        "dcf_nwc_ratio_default": safe_float(dcf_nwc_default),
-    }
-
-
-# ============================================================
-# HISTORICAL QUALITY / GROWTH
-# ============================================================
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def historical_analysis(data):
-    return {
-        "ROE_5Y": data.get("roe_5y"),
-        "Earnings_CAGR": data.get("earnings_cagr"),
-        "FCF_Yield": data.get("fcf_yield"),
+        "roe_hist": safe_float(history["roe_hist"]),
+        "earnings_cagr": safe_float(history["earnings_cagr"]),
+        "fcf_yield": safe_float(history["fcf_yield"]),
+        "buyback": safe_float(buyback),
+        "diluted_shares": safe_float(diluted_shares),
+        "company_ebit_margin": safe_float(ratio(ebit, revenue)),
+        "company_capex_ratio": safe_float(ratio(capex, revenue)),
+        "company_dep_ratio": safe_float(ratio(depreciation, revenue)),
+        "company_nwc_ratio": safe_float(ratio(current_nwc, revenue)),
     }
 
 
@@ -342,15 +304,11 @@ def operating_analysis(data):
     y1 = data["years"][1]
 
     def calculate_noa(year):
-        if year["assets"] is None or year["liab"] is None or year["cash"] is None or year["debt"] is None:
-            return None
-        operating_assets = year["assets"] - year["cash"]
-        operating_liabilities = year["liab"] - year["debt"]
+        operating_assets = (year["assets"] - year["cash"])
+        operating_liabilities = (year["liab"] - year["debt"])
         return operating_assets - operating_liabilities
 
     def calculate_nfo(year):
-        if year["debt"] is None or year["cash"] is None:
-            return None
         return year["debt"] - year["cash"]
 
     noa0 = calculate_noa(y0)
@@ -358,26 +316,28 @@ def operating_analysis(data):
     nfo0 = calculate_nfo(y0)
     nfo1 = calculate_nfo(y1)
 
-    average_noa = (noa0 + noa1) / 2 if noa0 is not None and noa1 is not None else None
-    average_nfo = (nfo0 + nfo1) / 2 if nfo0 is not None and nfo1 is not None else None
+    average_noa = (noa0 + noa1) / 2
+    average_nfo = (nfo0 + nfo1) / 2
 
-    tax_rate = 0.21
     if data["pretax"] is not None and data["tax"] is not None and data["pretax"] > 0:
         tax_rate = max(0.0, min(0.40, data["tax"] / data["pretax"]))
+    else:
+        tax_rate = 0.21
 
-    operating_income_after_tax = data["ebit"] * (1 - tax_rate) if data["ebit"] is not None else None
-    interest = abs(data["interest"] or 0.0)
-    net_financial_expense = interest * (1 - tax_rate) if interest is not None else None
+    operating_income_after_tax = data["ebit"] * (1 - tax_rate)
+    interest = abs(data["interest"] or 0)
+    net_financial_expense = interest * (1 - tax_rate)
 
-    rnoa = (operating_income_after_tax / average_noa) if operating_income_after_tax is not None and average_noa not in (None, 0) and average_noa > 0 else None
-    nbc = (net_financial_expense / average_nfo) if net_financial_expense is not None and average_nfo not in (None, 0) and average_nfo > 0 else None
-    flev = (nfo0 / y0["equity"]) if nfo0 is not None and y0["equity"] not in (None, 0) and y0["equity"] > 0 else None
+    rnoa = (operating_income_after_tax / average_noa) if average_noa and average_noa > 0 else None
+    nbc = (net_financial_expense / average_nfo) if average_nfo and average_nfo > 0 else None
+    flev = (nfo0 / y0["equity"]) if y0["equity"] and y0["equity"] > 0 else None
     spread = (rnoa - nbc) if rnoa is not None and nbc is not None else None
 
-    average_assets = (y0["assets"] + y1["assets"]) / 2 if y0["assets"] is not None and y1["assets"] is not None else None
-    accruals = None
-    if data["ni"] is not None and data["cfo"] is not None and average_assets not in (None, 0) and average_assets > 0:
+    average_assets = (y0["assets"] + y1["assets"]) / 2
+    if data["cfo"] is not None and average_assets and average_assets > 0:
         accruals = (data["ni"] - data["cfo"]) / average_assets
+    else:
+        accruals = None
 
     return {
         "tax_rate": tax_rate,
@@ -399,6 +359,7 @@ def residual_income_valuation(data, required_return, omega, terminal_growth, for
 
     current_book_value = y0["equity"]
     previous_book_value = y1["equity"]
+
     net_income = data["ni"]
     shares = data["shares"]
     price = data["price"]
@@ -413,25 +374,21 @@ def residual_income_valuation(data, required_return, omega, terminal_growth, for
         raise ValueError("missing shares outstanding")
     if price is None or price <= 0:
         raise ValueError("missing market price")
-    if required_return <= 0:
-        raise ValueError("required return must be positive")
     if required_return <= terminal_growth:
         raise ValueError("required return must exceed terminal growth")
-    if omega < 0 or omega > 1:
-        raise ValueError("omega must be between 0 and 1")
 
-    historical_roe = data.get("historical_roe")
+    historical_roe = data.get("roe_hist")
     if historical_roe is None:
         historical_roe = net_income / previous_book_value
+
     roe_base = clamp(historical_roe, -0.10, 0.50)
 
-    payout_ratio = 0.0
-    dividends = abs(data.get("div") or 0.0)
-    buyback = abs(data.get("buyback") or 0.0)
-    payout_cap = dividends + buyback
-    net_income_abs = abs(net_income)
-    if net_income_abs > 0 and payout_cap > 0:
-        payout_ratio = min(1.0, payout_cap / net_income_abs)
+    # Payout = dividends + share buybacks, capped at 100% of earnings.
+    distributions = abs(data["div"] or 0.0) + abs(data.get("buyback") or 0.0)
+    if net_income > 0 and distributions > 0:
+        payout_ratio = max(0.0, min(1.0, distributions / net_income))
+    else:
+        payout_ratio = 0.0
 
     book_value = current_book_value
     present_value_residual_income = 0.0
@@ -443,8 +400,8 @@ def residual_income_valuation(data, required_return, omega, terminal_growth, for
         beginning_book_value = book_value
         earnings = forecast_roe * beginning_book_value
         residual_income = earnings - (required_return * beginning_book_value)
-        dividends_paid = earnings * payout_ratio
-        ending_book_value = beginning_book_value + earnings - dividends_paid
+        dividends = earnings * payout_ratio
+        ending_book_value = beginning_book_value + earnings - dividends
         pv_residual_income = residual_income / ((1 + required_return) ** year)
         present_value_residual_income += pv_residual_income
 
@@ -499,6 +456,8 @@ def residual_income_valuation(data, required_return, omega, terminal_growth, for
 # ============================================================
 
 def calculate_implied_omega(data, required_return, terminal_growth, target_vp=1.0):
+    """Find the ROE persistence needed to reach a target V/P."""
+
     def model_vp(omega):
         try:
             value_to_price = residual_income_valuation(
@@ -510,6 +469,7 @@ def calculate_implied_omega(data, required_return, terminal_growth, target_vp=1.
             )["V/P"]
         except (ValueError, KeyError, TypeError, ZeroDivisionError, OverflowError):
             return None
+
         if pd.isna(value_to_price):
             return None
         return float(value_to_price)
@@ -554,8 +514,6 @@ def dcf_valuation(
     nwc_ratio,
     forecast_years=5,
 ):
-    if wacc <= 0:
-        raise ValueError("WACC must be positive")
     if wacc <= terminal_growth:
         raise ValueError("WACC must exceed terminal growth")
 
@@ -564,6 +522,7 @@ def dcf_valuation(
     base_nwc = data.get("nwc_operating") if data.get("nwc_operating") is not None else data.get("nwc")
     base_depreciation = data["depreciation"]
     base_capex = data["capex"]
+    net_debt = net_debt_from_balance_sheet(data["years"][0])
     shares = data["shares"]
     price = data["price"]
 
@@ -576,31 +535,12 @@ def dcf_valuation(
     if price is None or price <= 0:
         raise ValueError("missing market price")
 
-    net_debt = net_debt_from_balance_sheet(data["years"][0])
-
-    if base_depreciation is None:
-        base_depreciation = base_revenue * dep_ratio
-    if base_capex is None:
-        base_capex = base_revenue * capex_ratio
-    if base_nwc is None:
-        base_nwc = base_revenue * nwc_ratio
-
-    prior_nwc = data.get("prior_nwc_operating") if data.get("prior_nwc_operating") is not None else data.get("prior_nwc")
-    delta_nwc = (base_nwc - prior_nwc) if prior_nwc is not None else 0.0
-
     base_fcff = data["fcff_base"]
     if base_fcff is None:
-        base_fcff = base_ebit * (1 - tax_rate) + base_depreciation - base_capex - delta_nwc
-
-    if base_fcff is None or not math.isfinite(base_fcff):
-        raise ValueError("base-year FCFF is missing or not finite")
-    if base_fcff < 0:
-        base_fcff_note = "Negative base-year FCFF; valuation is highly sensitive to assumptions."
-    else:
-        base_fcff_note = None
+        base_fcff = base_ebit * (1 - tax_rate) + (base_depreciation or 0) - (base_capex or 0)
 
     revenue = base_revenue
-    nwc_prev = base_nwc
+    nwc_prev = base_nwc if base_nwc is not None else revenue * nwc_ratio
     forecast = []
     pv_fcff = 0.0
 
@@ -613,37 +553,29 @@ def dcf_valuation(
         delta_nwc = nwc - nwc_prev
         fcff = ebit * (1 - tax_rate) + depreciation - capex - delta_nwc
 
-        if not math.isfinite(fcff):
-            raise ValueError("non-finite FCFF in forecast")
-
         pv_fcff_year = fcff / ((1 + wacc) ** year)
         pv_fcff += pv_fcff_year
-        forecast.append({
-            "Year": year,
-            "Revenue": revenue,
-            "EBIT": ebit,
-            "Tax Rate": tax_rate,
-            "D&A": depreciation,
-            "CapEx": capex,
-            "NWC": nwc,
-            "ΔNWC": delta_nwc,
-            "FCFF": fcff,
-            "PV FCFF": pv_fcff_year,
-        })
+
+        forecast.append(
+            {
+                "Year": year,
+                "Revenue": revenue,
+                "EBIT": ebit,
+                "Tax Rate": tax_rate,
+                "D&A": depreciation,
+                "CapEx": capex,
+                "NWC": nwc,
+                "ΔNWC": delta_nwc,
+                "FCFF": fcff,
+                "PV FCFF": pv_fcff_year,
+            }
+        )
         nwc_prev = nwc
 
     terminal_fcff = forecast[-1]["FCFF"] * (1 + terminal_growth)
-    if not math.isfinite(terminal_fcff):
-        raise ValueError("terminal FCFF is not finite")
-    if terminal_fcff <= 0:
-        raise ValueError("terminal FCFF is non-positive; valuation is not economically meaningful")
     terminal_value = terminal_fcff / (wacc - terminal_growth)
-    if not math.isfinite(terminal_value):
-        raise ValueError("terminal value is not finite")
     pv_terminal = terminal_value / ((1 + wacc) ** forecast_years)
     enterprise_value = pv_fcff + pv_terminal
-    if enterprise_value <= 0:
-        raise ValueError("enterprise value is non-positive")
     equity_value = enterprise_value - net_debt
     value_per_share = equity_value / shares
     intrinsic_value_per_share = value_per_share
@@ -665,7 +597,6 @@ def dcf_valuation(
         "PV_FCFF": pv_fcff,
         "PV_terminal": pv_terminal,
         "terminal_fcff": terminal_fcff,
-        "base_fcff_note": base_fcff_note,
     }
 
 
@@ -689,6 +620,49 @@ def conservative_ri_valuation(data, required_return, omega, terminal_growth, for
 # COMPLETE COMPANY ANALYSIS
 # ============================================================
 
+DCF_INPUT_LIMITS = {
+    "operating_margin": (-0.20, 0.60),
+    "tax_rate": (0.10, 0.35),
+    "capex_ratio": (0.0, 0.30),
+    "dep_ratio": (0.0, 0.20),
+    "nwc_ratio": (-0.30, 0.60),
+}
+
+DCF_INPUT_LABELS = {
+    "operating_margin": "EBIT margin",
+    "tax_rate": "operating tax rate",
+    "capex_ratio": "CapEx / revenue",
+    "dep_ratio": "D&A / revenue",
+    "nwc_ratio": "NWC / revenue",
+}
+
+
+def resolve_dcf_inputs(data, override, sidebar_values):
+    """
+    Use each company's own latest ratios for the DCF unless the override is on
+    or the company's figure is missing (then use the sidebar value).
+    Returns (values, sources).
+    """
+    company_values = {
+        "operating_margin": data.get("company_ebit_margin"),
+        "tax_rate": data.get("effective_tax_rate"),
+        "capex_ratio": data.get("company_capex_ratio"),
+        "dep_ratio": data.get("company_dep_ratio"),
+        "nwc_ratio": data.get("company_nwc_ratio"),
+    }
+    values, sources = {}, {}
+    for key, sidebar_value in sidebar_values.items():
+        company_value = company_values.get(key)
+        if override or company_value is None:
+            values[key] = sidebar_value
+            sources[key] = "sidebar"
+        else:
+            lower, upper = DCF_INPUT_LIMITS[key]
+            values[key] = clamp(company_value, lower, upper)
+            sources[key] = "company"
+    return values, sources
+
+
 def analyze_company(
     data,
     required_return,
@@ -703,7 +677,7 @@ def analyze_company(
     dcf_dep_ratio,
     dcf_nwc_ratio,
     dcf_forecast_years=5,
-    override_dcf_assumptions=False,
+    dcf_override=False,
 ):
     y0 = data["years"][0]
     y1 = data["years"][1]
@@ -720,19 +694,6 @@ def analyze_company(
     if y0["equity"] <= 0:
         raise ValueError("non-positive book equity")
 
-    if override_dcf_assumptions:
-        selected_margin = dcf_operating_margin
-        selected_capex = dcf_capex_ratio
-        selected_dep = dcf_dep_ratio
-        selected_nwc = dcf_nwc_ratio
-        source_text = "sidebar assumption"
-    else:
-        selected_margin = data.get("dcf_ebit_margin_default") if data.get("dcf_ebit_margin_default") is not None else dcf_operating_margin
-        selected_capex = data.get("dcf_capex_ratio_default") if data.get("dcf_capex_ratio_default") is not None else dcf_capex_ratio
-        selected_dep = data.get("dcf_dep_ratio_default") if data.get("dcf_dep_ratio_default") is not None else dcf_dep_ratio
-        selected_nwc = data.get("dcf_nwc_ratio_default") if data.get("dcf_nwc_ratio_default") is not None else dcf_nwc_ratio
-        source_text = "company default"
-
     operating = operating_analysis(data)
     base = residual_income_valuation(
         data,
@@ -742,31 +703,27 @@ def analyze_company(
         forecast_years=5,
     )
 
-    try:
-        dcf = dcf_valuation(
-            data,
-            wacc=wacc,
-            terminal_growth=dcf_terminal_growth,
-            revenue_growth=dcf_revenue_growth,
-            operating_margin=selected_margin,
-            tax_rate=dcf_tax_rate,
-            capex_ratio=selected_capex,
-            dep_ratio=selected_dep,
-            nwc_ratio=selected_nwc,
-            forecast_years=dcf_forecast_years,
-        )
-    except (ValueError, TypeError, ZeroDivisionError):
-        dcf = {
-            "value_per_share": None,
-            "intrinsic_value_per_share": None,
-            "V/P": None,
-            "equity_value": None,
-            "net_debt": None,
-            "forecast": [],
-            "base_fcff_note": "DCF invalid because the inputs did not produce a valid FCFF valuation.",
-        }
+    dcf_inputs, dcf_sources = resolve_dcf_inputs(
+        data,
+        dcf_override,
+        {
+            "operating_margin": dcf_operating_margin,
+            "tax_rate": dcf_tax_rate,
+            "capex_ratio": dcf_capex_ratio,
+            "dep_ratio": dcf_dep_ratio,
+            "nwc_ratio": dcf_nwc_ratio,
+        },
+    )
+    dcf_inputs["revenue_growth"] = dcf_revenue_growth
 
-    historical = historical_analysis(data)
+    dcf = dcf_valuation(
+        data,
+        wacc=wacc,
+        terminal_growth=dcf_terminal_growth,
+        forecast_years=dcf_forecast_years,
+        **dcf_inputs,
+    )
+
     implied_omega = calculate_implied_omega(
         data,
         required_return=required_return,
@@ -783,24 +740,15 @@ def analyze_company(
     )
 
     warnings = []
-    if data["effective_tax_rate"] is None:
-        warnings.append("Effective tax rate unavailable; DCF uses the sidebar tax-rate input.")
-    if data["capex"] is None:
-        warnings.append("CapEx unavailable; DCF uses the sidebar CapEx/revenue assumption.")
-    if data["depreciation"] is None:
-        warnings.append("Depreciation unavailable; DCF uses the sidebar D&A/revenue assumption.")
-    if data.get("nwc_operating") is None:
-        warnings.append("Operating working capital unavailable; DCF uses the sidebar NWC/revenue assumption.")
-
-    if override_dcf_assumptions:
-        warnings.append("DCF uses the sidebar EBIT margin, CapEx/revenue, D&A/revenue, and NWC/revenue because override is enabled.")
+    if dcf_override:
+        warnings.append("DCF is using the sidebar assumptions for every company (override on).")
     else:
-        warnings.append(f"DCF uses the company default EBIT margin, CapEx/revenue, D&A/revenue, and NWC/revenue ({source_text}) for this stock.")
-
-    if y0["debt"] is None or y1["debt"] is None or y0["cash"] is None or y1["cash"] is None:
-        warnings.append("Yahoo Finance does not provide a complete debt/cash series; net debt and financing leverage are approximate.")
-    if any(value is None for value in [operating.get("RNOA"), operating.get("NBC"), operating.get("FLEV"), operating.get("spread"), operating.get("accruals")]):
-        warnings.append("One or more Penman operating metrics are incomplete because the underlying balance-sheet fields were aggregated or missing.")
+        for key, source in dcf_sources.items():
+            if source == "sidebar":
+                warnings.append(f"Company {DCF_INPUT_LABELS[key]} unavailable; DCF uses the sidebar assumption.")
+    diluted = data.get("diluted_shares")
+    if diluted is not None and data["shares"] and abs(diluted - data["shares"]) / data["shares"] > 0.05:
+        warnings.append("Share count changed meaningfully; buybacks/issuance may make per-share comparisons less reliable.")
 
     return {
         "Ticker": data["ticker"],
@@ -809,8 +757,8 @@ def analyze_company(
         "ROE": base["historical_roe"],
         "Cost of Equity": required_return,
         "WACC": wacc,
-        "Earnings CAGR": historical.get("Earnings_CAGR"),
-        "FCF Yield": historical.get("FCF_Yield"),
+        "Earnings CAGR": data.get("earnings_cagr"),
+        "FCF Yield": data.get("fcf_yield"),
         "Implied Omega": implied_omega,
         "RNOA": operating["RNOA"],
         "NBC": operating["NBC"],
@@ -825,9 +773,9 @@ def analyze_company(
         "RI Conservative V/P": conservative["V/P"],
         "DCF Value": dcf["value_per_share"],
         "DCF V/P": dcf["V/P"],
-        "DCF Upside": dcf["V/P"] - 1.0 if dcf.get("V/P") is not None else None,
+        "DCF Upside": dcf["V/P"] - 1.0,
 
-        "Net Debt": dcf.get("net_debt"),
+        "Net Debt ($B)": dcf["net_debt"] / 1e9,
         "Shares Outstanding": data["shares"],
         "Forecast Years": dcf_forecast_years,
         "Terminal %": base["terminal_percentage"],
@@ -835,6 +783,8 @@ def analyze_company(
         "warnings": warnings,
         "_base": base,
         "_dcf": dcf,
+        "_dcf_inputs": dcf_inputs,
+        "_dcf_sources": dcf_sources,
         "_conservative_ri": conservative,
         "_data": data,
     }
@@ -876,6 +826,16 @@ with st.sidebar:
     st.divider()
 
     st.header("DCF assumptions")
+
+    dcf_override = st.checkbox(
+        "Override with sidebar assumptions for all companies",
+        value=False,
+        help=(
+            "Off: the DCF uses each company's own EBIT margin, tax rate, CapEx, D&A and "
+            "working-capital ratios, and falls back to the values below only when a "
+            "company's figure is missing. On: the values below are used for every company."
+        ),
+    )
 
     wacc = st.number_input(
         "WACC",
@@ -950,46 +910,16 @@ with st.sidebar:
 
     dcf_nwc_ratio = st.number_input(
         "NWC / revenue",
-        min_value=0.00,
+        min_value=-0.30,
         max_value=0.60,
         value=0.10,
         step=0.005,
         format="%.3f",
     )
 
-    override_dcf_assumptions = st.checkbox(
-        "Override with sidebar assumptions",
-        value=False,
-        help="When off, the DCF uses each company's latest operating ratios, clamped to sensible ranges.",
-    )
-
     st.divider()
 
     st.header("Screening rules")
-
-    strong_ri_vp = st.number_input(
-        "Strong candidate RI V/P",
-        min_value=0.50,
-        max_value=5.00,
-        value=1.50,
-        step=0.05,
-    )
-
-    strong_dcf_vp = st.number_input(
-        "Strong candidate DCF V/P",
-        min_value=0.50,
-        max_value=5.00,
-        value=1.10,
-        step=0.05,
-    )
-
-    strong_omega_max = st.number_input(
-        "Strong candidate Ω max",
-        min_value=0.00,
-        max_value=1.00,
-        value=0.70,
-        step=0.05,
-    )
 
     min_ri_vp = st.number_input(
         "Minimum RI V/P",
@@ -1015,6 +945,22 @@ with st.sidebar:
         step=0.05,
     )
 
+    strong_ri_vp = st.number_input(
+        "Strong candidate: minimum RI V/P",
+        min_value=0.50,
+        max_value=5.00,
+        value=1.50,
+        step=0.05,
+    )
+
+    strong_max_omega = st.number_input(
+        "Strong candidate: maximum implied ω",
+        min_value=0.00,
+        max_value=1.00,
+        value=0.70,
+        step=0.05,
+    )
+
     max_accruals = st.number_input(
         "Maximum accruals",
         min_value=0.00,
@@ -1037,6 +983,23 @@ with st.sidebar:
 # TICKER INPUT
 # ============================================================
 
+# Inputs that change the valuations (not the verdict rules).
+current_assumptions = {
+    "required_return": required_return,
+    "omega": omega,
+    "terminal_growth": terminal_growth,
+    "wacc": wacc,
+    "dcf_terminal_growth": dcf_terminal_growth,
+    "dcf_forecast_years": dcf_forecast_years,
+    "dcf_revenue_growth": dcf_revenue_growth,
+    "dcf_operating_margin": dcf_operating_margin,
+    "dcf_tax_rate": dcf_tax_rate,
+    "dcf_capex_ratio": dcf_capex_ratio,
+    "dcf_dep_ratio": dcf_dep_ratio,
+    "dcf_nwc_ratio": dcf_nwc_ratio,
+    "dcf_override": dcf_override,
+}
+
 st.subheader("Enter stocks")
 
 ticker_text = st.text_area(
@@ -1049,7 +1012,7 @@ ticker_text = st.text_area(
 run_screener = st.button(
     "🚀 Run Screener",
     type="primary",
-    use_container_width=True,
+    width="stretch",
 )
 
 
@@ -1058,60 +1021,40 @@ def render_results(df):
         st.info("Enter tickers above and click **Run Screener**.")
         return
 
-    current_assumptions = assumptions_snapshot()
-    if st.session_state.get("last_assumptions") is not None and current_assumptions != st.session_state.last_assumptions:
-        st.warning("Assumptions changed - click Run Screener to update")
-
     def get_verdict(row):
         ri_vp = row["RI V/P"]
         dcf_vp = row["DCF V/P"]
         implied_omega = row["Implied Omega"]
         conservative_vp = row.get("RI Conservative V/P")
 
-        strong_ok = (
-            pd.notna(ri_vp)
-            and ri_vp >= strong_ri_vp
-            and pd.notna(dcf_vp)
-            and dcf_vp >= strong_dcf_vp
-            and pd.notna(implied_omega)
-            and implied_omega <= strong_omega_max
-            and pd.notna(conservative_vp)
-            and conservative_vp >= min_conservative_vp
-            and pd.notna(row["ROE"])
-            and row["ROE"] > required_return
-            and pd.notna(row["Accruals"])
-            and row["Accruals"] <= max_accruals
-            and pd.notna(row["FLEV"])
-            and row["FLEV"] <= max_flev
+        passes_candidate = (
+            ri_vp >= min_ri_vp
+            and dcf_vp >= min_dcf_vp
+            and (pd.isna(conservative_vp) or conservative_vp >= min_conservative_vp)
+            and (pd.isna(row["ROE"]) or row["ROE"] > required_return)
+            and (pd.isna(row["Accruals"]) or row["Accruals"] <= max_accruals)
+            and (pd.isna(row["FLEV"]) or row["FLEV"] <= max_flev)
         )
-        if strong_ok:
+
+        if (
+            passes_candidate
+            and ri_vp >= strong_ri_vp
+            and pd.notna(implied_omega)
+            and implied_omega <= strong_max_omega
+        ):
             return "STRONG CANDIDATE"
 
-        candidate_ok = (
-            pd.notna(ri_vp)
-            and ri_vp >= min_ri_vp
-            and pd.notna(dcf_vp)
-            and dcf_vp >= min_dcf_vp
-            and pd.notna(conservative_vp)
-            and conservative_vp >= min_conservative_vp
-            and pd.notna(row["ROE"])
-            and row["ROE"] > required_return
-            and pd.notna(row["Accruals"])
-            and row["Accruals"] <= max_accruals
-            and pd.notna(row["FLEV"])
-            and row["FLEV"] <= max_flev
-        )
-        if candidate_ok:
+        if passes_candidate:
             return "CANDIDATE"
 
-        if (pd.notna(ri_vp) and ri_vp >= min_ri_vp) or (pd.notna(dcf_vp) and dcf_vp >= min_dcf_vp):
+        if ri_vp >= min_ri_vp or dcf_vp >= min_dcf_vp:
             return "WATCH"
 
         return "NO"
 
     df = df.copy()
     df["Verdict"] = df.apply(get_verdict, axis=1)
-    df = df.sort_values(["RI V/P", "DCF V/P"], ascending=False, na_position="last").reset_index(drop=True)
+    df = df.sort_values(["RI V/P", "DCF V/P"], ascending=False).reset_index(drop=True)
     st.session_state.screen_results = df
 
     candidate_count = df["Verdict"].isin(["STRONG CANDIDATE", "CANDIDATE"]).sum()
@@ -1147,7 +1090,7 @@ def render_results(df):
         "DCF Value",
         "DCF V/P",
         "DCF Upside",
-        "Net Debt",
+        "Net Debt ($B)",
         "Shares Outstanding",
         "Forecast Years",
         "Terminal %",
@@ -1155,8 +1098,6 @@ def render_results(df):
     ]
 
     display = df[display_columns].copy()
-    if "Net Debt" in display.columns and display["Net Debt"].notna().any():
-        display["Net Debt"] = display["Net Debt"] / 1e9
 
     st.dataframe(
         display.style.format(
@@ -1175,21 +1116,21 @@ def render_results(df):
                 "Accruals": "{:.1%}",
                 "Implied Omega": "{:.2f}",
                 "RI Value": "${:,.2f}",
-                "RI V/P": "{:.2f}x",
-                "RI Upside": "{:.1%}",
                 "RI Conservative Value": "${:,.2f}",
+                "RI V/P": "{:.2f}x",
                 "RI Conservative V/P": "{:.2f}x",
+                "RI Upside": "{:.1%}",
                 "DCF Value": "${:,.2f}",
                 "DCF V/P": "{:.2f}x",
                 "DCF Upside": "{:.1%}",
-                "Net Debt": "${:.2f}B",
+                "Net Debt ($B)": "${:,.1f}B",
                 "Shares Outstanding": "{:,.0f}",
                 "Forecast Years": "{:,.0f}",
                 "Terminal %": "{:.1%}",
             },
             na_rep="—",
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -1209,15 +1150,16 @@ def render_results(df):
 
     base = selected["_base"]
     dcf = selected["_dcf"]
+    conservative = selected.get("_conservative_ri", {})
 
     left, right = st.columns(2)
 
     with left:
         st.markdown("### Valuation")
         st.write(f"**Market price:** ${selected['Price']:.2f}")
-        st.write(f"**Residual income value per share:** ${selected['RI Value']:.2f}")
+        st.write(f"**RI value per share:** ${selected['RI Value']:.2f}")
         st.write(f"**RI V/P:** {selected['RI V/P']:.2f}x")
-        st.write(f"**Conservative RI value per share:** ${selected['RI Conservative Value']:.2f}")
+        st.write(f"**Conservative RI per-share value:** ${selected['RI Conservative Value']:.2f}")
         st.write(f"**Conservative RI V/P:** {selected['RI Conservative V/P']:.2f}x")
         st.write(f"**RI upside:** {selected['RI Upside']:.1%}")
         st.write(f"**DCF value per share:** ${selected['DCF Value']:.2f}")
@@ -1236,11 +1178,11 @@ def render_results(df):
         st.write(f"**Accruals:** {fmt_pct(selected['Accruals'])}")
         st.write(f"**Cost of equity:** {fmt_pct(selected['Cost of Equity'])}")
         st.write(f"**WACC:** {fmt_pct(selected['WACC'])}")
-        st.write(f"**Net debt:** ${selected['Net Debt'] / 1e9:.2f}B")
-        st.write(f"**Shares outstanding:** {selected['Shares Outstanding']:.0f}")
+        st.write(f"**Net debt:** ${selected['Net Debt ($B)']:,.1f}B")
+        st.write(f"**Shares outstanding:** {selected['Shares Outstanding']:,.0f}")
 
     if selected["Verdict"] == "STRONG CANDIDATE":
-        st.success("STRONG CANDIDATE — passes the stronger RI and DCF checks and all quality screens.")
+        st.success("STRONG CANDIDATE — passes the stronger RI and DCF checks.")
     elif selected["Verdict"] == "CANDIDATE":
         st.success("CANDIDATE — passes the current screening rules.")
     elif selected["Verdict"] == "WATCH":
@@ -1261,11 +1203,21 @@ def render_results(df):
                 "PV Residual Income": "{:,.0f}",
             }
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
     st.subheader("💸 Five-year FCFF forecast")
+    inputs_used = selected["_dcf_inputs"]
+    sources_used = selected["_dcf_sources"]
+    st.caption(
+        "DCF inputs used — "
+        + ", ".join(
+            f"{DCF_INPUT_LABELS[k]}: {inputs_used[k]:.1%} ({sources_used[k]})"
+            for k in DCF_INPUT_LABELS
+        )
+        + f", revenue growth: {inputs_used['revenue_growth']:.1%} (sidebar)"
+    )
     dcf_forecast_df = pd.DataFrame(dcf["forecast"])
     st.dataframe(
         dcf_forecast_df.style.format(
@@ -1281,7 +1233,7 @@ def render_results(df):
                 "PV FCFF": "{:,.0f}",
             }
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -1333,7 +1285,7 @@ Neither valuation should be treated as a guaranteed buy.
                     ri = residual_income_valuation(
                         selected["_data"],
                         required_return=required,
-                        omega=omega,
+                        omega=selected["_base"]["omega"],
                         terminal_growth=g,
                         forecast_years=5,
                     )["value_per_share"]
@@ -1342,9 +1294,9 @@ Neither valuation should be treated as a guaranteed buy.
                     pass
         if ri_rows:
             ri_sensitivity = pd.DataFrame(ri_rows).pivot_table(index="Cost of Equity", columns="RI Growth", values="RI Value", aggfunc="first")
-            st.dataframe(ri_sensitivity.style.format("{:,.2f}"), use_container_width=True)
+            st.dataframe(ri_sensitivity.style.format("{:,.2f}"), width="stretch")
         else:
-            st.info("No RI sensitivity results available for this company.")
+            st.info("Not enough data for the residual-income sensitivity table.")
 
         st.subheader("DCF sensitivity: WACC vs FCFF terminal growth")
         dcf_rows = []
@@ -1355,22 +1307,17 @@ Neither valuation should be treated as a guaranteed buy.
                         selected["_data"],
                         wacc=w,
                         terminal_growth=g,
-                        revenue_growth=dcf_revenue_growth,
-                        operating_margin=dcf_operating_margin,
-                        tax_rate=dcf_tax_rate,
-                        capex_ratio=dcf_capex_ratio,
-                        dep_ratio=dcf_dep_ratio,
-                        nwc_ratio=dcf_nwc_ratio,
                         forecast_years=dcf_forecast_years,
+                        **selected["_dcf_inputs"],
                     )["value_per_share"]
                     dcf_rows.append({"WACC": w, "FCFF Growth": g, "DCF Value": d})
                 except Exception:
                     pass
         if dcf_rows:
             dcf_sensitivity = pd.DataFrame(dcf_rows).pivot_table(index="WACC", columns="FCFF Growth", values="DCF Value", aggfunc="first")
-            st.dataframe(dcf_sensitivity.style.format("{:,.2f}"), use_container_width=True)
+            st.dataframe(dcf_sensitivity.style.format("{:,.2f}"), width="stretch")
         else:
-            st.info("No DCF sensitivity results available for this company.")
+            st.info("Not enough data for the DCF sensitivity table.")
 
     with st.expander("✅ Formula validation example"):
         st.markdown(
@@ -1403,17 +1350,13 @@ This is exactly how the RI model computes the first forecast row.
             validate_df.style.format(
                 {"Beginning BV": "${:,.0f}", "NI": "${:,.0f}", "Dividend": "${:,.0f}", "Required Return": "{:.0%}", "RI": "${:,.0f}", "Ending BV": "${:,.0f}"}
             ),
-            use_container_width=True,
+            width="stretch",
         )
 
 
 # ============================================================
 # RUN SCREENER
 # ============================================================
-
-current_assumptions = assumptions_snapshot()
-if st.session_state.get("last_assumptions") is not None and current_assumptions != st.session_state.last_assumptions:
-    st.warning("Assumptions changed - click Run Screener to update")
 
 if run_screener:
     if required_return <= terminal_growth:
@@ -1456,7 +1399,7 @@ if run_screener:
                     dcf_dep_ratio=dcf_dep_ratio,
                     dcf_nwc_ratio=dcf_nwc_ratio,
                     dcf_forecast_years=dcf_forecast_years,
-                    override_dcf_assumptions=override_dcf_assumptions,
+                    dcf_override=dcf_override,
                 )
                 results.append(result)
         except Exception as error:
@@ -1474,11 +1417,16 @@ if run_screener:
 
     df = pd.DataFrame(results)
     st.session_state.screen_results = df
-    st.session_state.last_assumptions = current_assumptions.copy()
+    st.session_state.screen_assumptions = current_assumptions
     render_results(df)
 
 else:
     if st.session_state.screen_results is not None:
+        if st.session_state.screen_assumptions != current_assumptions:
+            st.warning(
+                "Assumptions changed - click **Run Screener** to update the valuations. "
+                "Verdict rules apply immediately, but the values shown are from the last run."
+            )
         render_results(st.session_state.screen_results)
     else:
         st.info("Enter tickers above and click **Run Screener**.")
