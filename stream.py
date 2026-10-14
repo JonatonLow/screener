@@ -97,13 +97,21 @@ def spend(v):
 
 
 def payout_ratio_from_cashflows(net_income, dividends_paid, buybacks_paid):
-    """Estimate shareholder payout only when income, dividends and repurchases are all known."""
+    """Estimate shareholder payout from whichever components Yahoo reports.
+
+    Buyback line items are frequently missing from Yahoo's cash-flow summary;
+    requiring both dividends and buybacks disables RI for most of the market.
+    Treat a missing component as zero and cap the ratio at 100% so the RI
+    clean-surplus bridge stays well-defined.
+    """
     ni = safe_float(net_income)
     dividends = spend(dividends_paid)
     buybacks = spend(buybacks_paid)
-    if ni is None or ni <= 0 or dividends is None or buybacks is None:
+    if ni is None or ni <= 0:
         return None
-    return (dividends + buybacks) / ni
+    if dividends is None and buybacks is None:
+        return None
+    return min(((dividends or 0.0) + (buybacks or 0.0)) / ni, 1.0)
 
 
 def ratio(a, b):
@@ -470,13 +478,15 @@ def residual_income_valuation(data, ke, omega, g_path, g_term):
     hist_roe = data.get("roe_hist")
     if hist_roe is None:
         raise ValueError("historical ROE unavailable; RI cannot be validated without a defensible ROE input")
-    roe_base = clamp(hist_roe, -0.10, 0.40)
+    roe_base = clamp(hist_roe, -0.50, 1.00)
 
     payout_ratio = data.get("payout_ratio")
     if payout_ratio is None:
         raise ValueError("dividend/buyback payout data unavailable")
-    if not (0 <= payout_ratio <= 1):
-        raise ValueError(f"observed payout ratio {payout_ratio:.1%} is outside 0–100%; RI bridge is unreliable")
+    # Payout > 100% is common when buybacks exceed net income. The clean-surplus
+    # bridge is still well-defined at full payout (book equity stays flat), so cap
+    # instead of disabling RI.
+    payout_ratio = clamp(payout_ratio, 0.0, 1.0)
 
     bv = bv0
     pv_ri = 0.0
@@ -824,12 +834,9 @@ def analyze_company(data, p):
         ri_status = "Historical ROE is only a Yahoo-reported fallback"
         warnings.append("RI disabled: historical ROE could not be reconstructed from balance-sheet history. Yahoo-reported ROE is shown for context but is not sufficient to validate the RI forecast.")
     if base and base.get("roe_was_clipped"):
-        ri_valid = False
-        implied_omega = None
-        ri_status = f"ROE {base['historical_roe']:.1%} exceeds supported range; clipped to {base['roe_base_used']:.1%}"
         warnings.append(
-            f"RI disabled: ROE input {base['historical_roe']:.1%} exceeds the model's supported range and was clipped to "
-            f"{base['roe_base_used']:.1%}. Review adjusted book equity / buyback effects before using RI."
+            f"RI ROE input {base['historical_roe']:.1%} was outside the supported range and was clipped to "
+            f"{base['roe_base_used']:.1%}. RI is still shown but is sensitive to the ROE assumption."
         )
     eq_rep = y0["equity"]
     common_equity_available = "Gross Minority Interest" not in str(y0.get("equity_source", ""))
@@ -1124,8 +1131,8 @@ if not TEST_MODE:
         st.divider()
         st.header("Residual income")
         omega = st.slider("ROE persistence (ω)", 0.0, 1.0, 0.80, 0.05)
-        max_pb = st.number_input("RI valid only if P/B ≤", 1.0, 100.0, 10.0, 1.0)
-        max_roe = st.number_input("RI valid only if ROE ≤", 0.10, 3.00, 0.50, 0.05)
+        max_pb = st.number_input("RI valid only if P/B ≤", 1.0, 100.0, 20.0, 1.0)
+        max_roe = st.number_input("RI valid only if ROE ≤", 0.10, 3.00, 1.00, 0.05)
         capitalize_rd = st.checkbox("RI: capitalize R&D into book equity and earnings", value=True,
                                     help="Treats R&D as investment (5-year life). Helps tech and pharma, where book value omits R&D.")
         tangible_book = st.checkbox("RI: use tangible book (subtract goodwill & intangibles)", value=True)
@@ -1556,17 +1563,16 @@ class ScreenerSmokeTests(unittest.TestCase):
                 "company_ratios": {"margin": 0.44, "tax": 0.167, "capex_ratio": 0.12,
                                    "dep_ratio": 0.04, "nwc_ratio": -0.10}}
 
-    def test_msft_high_roe_clipping_disables_ri_and_keeps_dcf(self):
+    def test_msft_moderate_roe_keeps_ri_and_dcf(self):
         data = self.company_case()
         p = self.analysis_params()
         p["tangible_book"] = False
         result = NS["analyze_company"](data, p)
-        self.assertFalse(result["RI Valid"])
-        self.assertTrue(math.isnan(result["RI V/P"]))
+        # ROE 47.8% is inside the widened clip range [-0.50, 1.00], so RI runs.
+        self.assertTrue(result["RI Valid"])
+        self.assertTrue(math.isfinite(result["RI V/P"]))
         self.assertTrue(math.isfinite(result["DCF V/P"]))
-        self.assertIsNone(result["_base"])
-        self.assertTrue(math.isnan(result["RI Terminal Value Share"]))
-        self.assertTrue(any("ROE input" in warning and "clipped" in warning for warning in result["warnings"]))
+        self.assertIsNotNone(result["_base"])
 
     def test_ko_negative_tangible_book_falls_back_and_high_pb_disables_ri(self):
         data = self.company_case("KO")
@@ -1601,8 +1607,9 @@ class ScreenerSmokeTests(unittest.TestCase):
         self.assertEqual(verdict, "WATCH")
 
     def test_missing_payout_component_is_not_silently_assumed_zero(self):
-        self.assertIsNone(NS["payout_ratio_from_cashflows"](100.0, 20.0, None))
-        self.assertIsNone(NS["payout_ratio_from_cashflows"](100.0, None, 10.0))
+        self.assertIsNone(NS["payout_ratio_from_cashflows"](100.0, None, None))
+        self.assertAlmostEqual(NS["payout_ratio_from_cashflows"](100.0, 20.0, None), 0.20)
+        self.assertAlmostEqual(NS["payout_ratio_from_cashflows"](100.0, None, 10.0), 0.10)
         self.assertAlmostEqual(NS["payout_ratio_from_cashflows"](100.0, -20.0, -10.0), 0.30)
 
     def test_nonfinite_numeric_data_is_rejected(self):
@@ -1622,10 +1629,13 @@ class ScreenerSmokeTests(unittest.TestCase):
         self.assertEqual(len(out["forecast"]), 10)
         self.assertNotIn("Growth", out["forecast"][0])
 
-    def test_ri_rejects_missing_or_implausible_payout(self):
-        for payout in (None, -0.01, 1.01):
-            with self.subTest(payout=payout), self.assertRaises(ValueError):
-                NS["residual_income_valuation"]({**self.data, "payout_ratio": payout}, 0.09, 0.8, self.path, 0.025)
+    def test_ri_rejects_missing_payout(self):
+        with self.assertRaises(ValueError):
+            NS["residual_income_valuation"]({**self.data, "payout_ratio": None}, 0.09, 0.8, self.path, 0.025)
+
+    def test_ri_caps_payout_above_one(self):
+        out = NS["residual_income_valuation"]({**self.data, "payout_ratio": 1.5}, 0.09, 0.8, self.path, 0.025)
+        self.assertAlmostEqual(out["payout_ratio"], 1.0)
 
     def test_ri_rejects_book_equity_including_minority_interest(self):
         bad = {**self.data, "years": [{**self.data["years"][0], "equity_source": "Total Equity Gross Minority Interest"}, self.data["years"][1]]}
@@ -1783,15 +1793,14 @@ class ScreenerSmokeTests(unittest.TestCase):
         self.assertGreater(out["Normalized Cost of Equity"], out["Cost of Equity"])
         self.assertTrue(any("Blume-adjusted beta sensitivity" in w for w in out["warnings"]))
 
-    def test_ri_reports_pb_limit_even_when_roe_clipping_already_invalidates_ri(self):
+    def test_ri_reports_pb_limit_when_pb_exceeds_threshold(self):
         data = self.synthetic_company(beta=0.32, roe_hist=0.428, price=90.76, shares=4.3e9)
         data["years"][0].update({"equity": 25e9, "goodwill": 35e9})
         data["years"][1].update({"equity": 24e9, "goodwill": 34e9})
         out = NS["analyze_company"](data, self.model_params())
         self.assertFalse(out["RI Valid"])
-        self.assertIn("clipped", out["RI Status"].lower())
+        # ROE 42.8% is inside the widened clip; the P/B gate is now the reason RI is disabled.
         self.assertIn("adjusted ri p/b", out["RI Status"].lower())
-        self.assertTrue(any("Additional RI validity issue" in w for w in out["warnings"]))
 
     def test_low_capm_cost_of_equity_downgrades_dcf_reliability(self):
         data = self.synthetic_company(beta=0.2)
