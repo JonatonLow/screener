@@ -1,3 +1,4 @@
+
 import pandas as pd
 import streamlit as st
 import yfinance as yf
@@ -206,6 +207,7 @@ def fetch_data(symbol):
         "cfo": pick(cf, ["Operating Cash Flow", "Total Cash From Operating Activities"], 0),
         "div": pick(cf, ["Cash Dividends Paid", "Common Stock Dividend Paid"], 0),
         "buyback": pick(cf, ["Repurchase Of Capital Stock", "Common Stock Payments"], 0),
+        "rd": row_values(inc, ["Research And Development", "Research Development"]),
         "diluted_shares": pick(inc, ["Diluted Average Shares", "Weighted Average Shares Diluted"], 0),
         "effective_tax_rate": etr,
         "rev_cagr": rev_cagr,
@@ -381,7 +383,7 @@ def calculate_implied_omega(data, ke, g_path, g_term, target=1.0):
 # ============================================================
 
 
-def dcf_valuation(data, wacc, g_path, g_term, margin, tax, capex_ratio, dep_ratio, nwc_ratio, term_roic):
+def dcf_valuation(data, wacc, g_path, g_term, margin, tax, capex_ratio, dep_ratio, nwc_ratio, term_roic, margin_end=None):
     if wacc <= g_term:
         raise ValueError("WACC must exceed terminal growth")
     y0 = data["years"][0]
@@ -399,7 +401,8 @@ def dcf_valuation(data, wacc, g_path, g_term, margin, tax, capex_ratio, dep_rati
     pv_fcff, forecast, nopat = 0.0, [], 0.0
     for t, g in enumerate(g_path, 1):
         rev *= 1 + g
-        ebit = rev * margin
+        m_t = margin + ((margin if margin_end is None else margin_end) - margin) * t / len(g_path)  # linear ramp
+        ebit = rev * m_t
         nopat = ebit * (1 - tax)
         dep, nwc = rev * dep_ratio, rev * nwc_ratio
         # capex/revenue fades toward ~1.1x D&A by the last forecast year (matches the terminal reinvestment logic)
@@ -493,19 +496,34 @@ def analyze_company(data, p):
     if ke <= g_term + 0.01 or wacc <= g_term:
         raise ValueError("discount rate too close to terminal growth")
     g0 = start_growth(data, p)
+    is_growth = g0 >= p["growth_threshold"]  # growth mode: longer fade, latest margin, optional margin ramp
+    if is_growth:
+        years = p["growth_years"]
     g_path = growth_path(g0, g_term, years)
 
     warnings = []
-    ri_data = data
+    eq0, eq1, ni_adj = y0["equity"], y1["equity"], data["ni"]
+    adjusted = False
     if p["tangible_book"]:
         gw0, gw1 = y0["goodwill"], y1["goodwill"]
-        if gw0 is not None and gw1 is not None and y0["equity"] and y1["equity"]:
-            tb0, tb1 = y0["equity"] - gw0, y1["equity"] - gw1
-            ri_data = {**data, "years": [{**y0, "equity": tb0}, {**y1, "equity": tb1}],
-                       "roe_hist": (data["ni"] / tb1) if data["ni"] is not None and tb1 > 0 else None}
-            warnings.append("RI uses tangible book (goodwill and intangibles removed from equity); ROE is on tangible book.")
+        if gw0 is not None and gw1 is not None and eq0 and eq1:
+            eq0, eq1, adjusted = eq0 - gw0, eq1 - gw1, True
+            warnings.append("RI uses tangible book (goodwill and intangibles removed from equity).")
         else:
             warnings.append("Goodwill/intangibles not reported; RI uses reported book equity.")
+    rd = [v for v in (data.get("rd") or []) if v is not None and v > 0]
+    if p["capitalize_rd"] and len(rd) >= 2 and eq0 and eq1 and ni_adj is not None:
+        life, tx = 5, data["effective_tax_rate"] if data["effective_tax_rate"] is not None else 0.21
+        # straight-line amortization over `life` years; only the years Yahoo reports (usually 3-4) are available
+        a0 = sum(v * max(0.0, 1 - (k + 0.5) / life) for k, v in enumerate(rd)) * (1 - tx)
+        a1 = sum(v * max(0.0, 1 - (k - 0.5) / life) for k, v in enumerate(rd) if k >= 1) * (1 - tx)
+        amort0 = sum(rd[k] / life for k in range(1, min(len(rd), life + 1)))
+        eq0, eq1, ni_adj, adjusted = eq0 + a0, eq1 + a1, ni_adj + (rd[0] - amort0) * (1 - tx), True
+        warnings.append("RI capitalizes R&D (5-year life, after tax) into book equity and earnings; approximate, based on the R&D years Yahoo reports.")
+    ri_data = data
+    if adjusted:
+        ri_data = {**data, "years": [{**y0, "equity": eq0}, {**y1, "equity": eq1}], "ni": ni_adj,
+                   "roe_hist": (ni_adj / eq1) if ni_adj is not None and eq1 > 0 else None}
     base = cons = implied_omega = None
     try:
         base = residual_income_valuation(ri_data, ke, p["omega"], g_path, g_term)
@@ -515,7 +533,7 @@ def analyze_company(data, p):
         implied_omega = calculate_implied_omega(ri_data, ke, g_path, g_term)
     except ValueError as e:
         warnings.append(f"Residual income unavailable: {e}."
-                        + (" Tangible book is negative or missing; untick the tangible-book option to use reported book." if ri_data is not data else ""))
+                        + (" Adjusted book is negative or missing; untick the tangible-book option to use reported book." if ri_data is not data else ""))
 
     ri_valid = base is not None
     eq_rep = y0["equity"]
@@ -530,12 +548,37 @@ def analyze_company(data, p):
 
     dcf_inputs, dcf_sources = resolve_dcf_inputs(data, p)
     lo = wacc + 0.01
-    hi = max(p["roic_cap"], lo)
     rnoa = operating["RNOA"]
+    high_return = rnoa is not None and rnoa >= 0.25
+    hi = max(p["quality_roic_cap"] if high_return else p["roic_cap"], lo)
+    if is_growth and not p["override"]:
+        if data["ebit"] is not None and data["revenue"]:
+            dcf_inputs["margin"] = clamp(data["ebit"] / data["revenue"], *DCF_LIMITS["margin"])
+    dcf_inputs["margin_end"] = clamp(dcf_inputs["margin"] + (p["margin_expansion"] if is_growth else 0.0), -0.20, 0.60)
     dcf_inputs["term_roic"] = clamp(rnoa if rnoa is not None else lo + 0.02, lo, hi)
     dcf = dcf_valuation(data, wacc, g_path, g_term, **dcf_inputs)
     implied_g = implied_start_growth(data, wacc, g_term, years, dcf_inputs)
     dcf_ok = dcf["value_per_share"] > 0
+
+    def scenario_vp(g_mult, g_add, margin_add, roic_add):
+        try:
+            gs = clamp((g0 * g_mult if g0 > 0 else g0) + g_add, -0.10, 0.30)
+            inp = dict(dcf_inputs)
+            inp["margin_end"] = clamp(inp["margin_end"] + margin_add, -0.20, 0.60)
+            inp["term_roic"] = clamp(inp["term_roic"] + roic_add, lo, max(hi, lo + 0.15))
+            v = dcf_valuation(data, wacc, growth_path(gs, g_term, years), g_term, **inp)["V/P"]
+            return v if v > 0 else NAN
+        except Exception:
+            return NAN
+
+    bear_vp = scenario_vp(0.6, -0.01, -0.03, -0.05)
+    bull_vp = scenario_vp(1.3, 0.02, 0.04, 0.05)
+    if is_growth:
+        warnings.append(
+            f"Growth mode: starting growth {g0:.1%} is at or above {p['growth_threshold']:.0%}, so the fade runs {years} years "
+            f"and the DCF uses the latest EBIT margin ({dcf_inputs['margin']:.1%}) ending at {dcf_inputs['margin_end']:.1%}.")
+    if high_return:
+        warnings.append(f"High-return business (RNOA {rnoa:.0%}): terminal ROIC cap raised to {p['quality_roic_cap']:.0%}.")
     if not dcf_ok:
         implied_g = None
         warnings.append("DCF equity value is negative (net debt exceeds enterprise value); DCF shown as n/m.")
@@ -588,13 +631,15 @@ def analyze_company(data, p):
         "RI Conservative V/P": ri(cons, "V/P"),
         "DCF Value": dcf["value_per_share"] if dcf_ok else NAN,
         "DCF V/P": dcf["V/P"] if dcf_ok else NAN,
+        "DCF Bear V/P": bear_vp,
+        "DCF Bull V/P": bull_vp,
         "Net Debt ($B)": dcf["net_debt"] / 1e9,
         "Shares Outstanding": data["shares"],
         "RI Terminal %": base["terminal_pct"] if base else NAN,
         "DCF Terminal %": dcf["terminal_pct"],
         "warnings": warnings,
         "_base": base, "_dcf": dcf, "_dcf_inputs": dcf_inputs, "_dcf_sources": dcf_sources,
-        "_data": ri_data, "_g0": g0, "_ke": ke, "_wacc": wacc,
+        "_data": ri_data, "_years": years, "_g0": g0, "_ke": ke, "_wacc": wacc,
     }
 
 
@@ -619,12 +664,17 @@ with st.sidebar:
     use_company_growth = st.checkbox("Start from company revenue CAGR", value=True)
     max_start_growth = st.number_input("Max starting growth", 0.00, 0.40, 0.15, 0.01, format="%.2f")
     start_growth_fb = st.number_input("Starting growth (fallback / manual)", -0.10, 0.40, 0.06, 0.005, format="%.3f")
+    growth_threshold = st.number_input("Growth mode if starting growth ≥", 0.05, 0.40, 0.10, 0.01, format="%.2f",
+                                       help="Growth names get a longer fade and the latest margin instead of the 3-year average.")
+    growth_years = st.number_input("Growth mode: fade years", 10, 25, 15, 1)
 
     st.divider()
     st.header("Residual income")
     omega = st.slider("ROE persistence (ω)", 0.0, 1.0, 0.80, 0.05)
     max_pb = st.number_input("RI valid only if P/B ≤", 1.0, 100.0, 10.0, 1.0)
     max_roe = st.number_input("RI valid only if ROE ≤", 0.10, 3.00, 0.50, 0.05)
+    capitalize_rd = st.checkbox("RI: capitalize R&D into book equity and earnings", value=True,
+                                help="Treats R&D as investment (5-year life). Helps tech and pharma, where book value omits R&D.")
     tangible_book = st.checkbox("RI: use tangible book (subtract goodwill & intangibles)", value=True)
 
     st.divider()
@@ -638,6 +688,11 @@ with st.sidebar:
     fb_nwc = st.number_input("NWC / revenue", -0.05, 0.40, 0.05, 0.005, format="%.3f")
     roic_cap = st.number_input("Terminal ROIC cap", 0.05, 0.50, 0.15, 0.01, format="%.2f",
                                help="Terminal reinvestment = g / ROIC. ROIC is the company's RNOA, floored at WACC+1% and capped here.")
+
+    quality_roic_cap = st.number_input("Terminal ROIC cap, high-return firms (RNOA ≥ 25%)", 0.10, 0.60, 0.25, 0.01, format="%.2f",
+                                       help="Firms with a durable moat can keep higher returns on new investment.")
+    margin_expansion = st.number_input("Growth mode: extra margin expansion by end of fade", 0.00, 0.20, 0.00, 0.01, format="%.2f",
+                                       help="Added to the latest EBIT margin, ramped linearly. 0 = hold the latest margin.")
 
     st.divider()
     st.header("Screening rules")
@@ -653,8 +708,10 @@ P = {
     "use_capm": use_capm, "rf": rf, "erp": erp, "kd": kd, "flat_ke": flat_ke, "flat_wacc": flat_wacc,
     "terminal_growth": terminal_growth, "years": forecast_years, "use_company_growth": use_company_growth,
     "max_start_growth": max_start_growth, "start_growth": start_growth_fb, "omega": omega,
-    "max_pb": max_pb, "max_roe": max_roe, "tangible_book": tangible_book, "override": dcf_override, "fb_margin": fb_margin,
+    "max_pb": max_pb, "max_roe": max_roe, "tangible_book": tangible_book, "capitalize_rd": capitalize_rd, "override": dcf_override, "fb_margin": fb_margin,
     "fb_tax": fb_tax, "fb_capex": fb_capex, "fb_dep": fb_dep, "fb_nwc": fb_nwc, "roic_cap": roic_cap,
+    "growth_threshold": growth_threshold, "growth_years": growth_years, "quality_roic_cap": quality_roic_cap,
+    "margin_expansion": margin_expansion,
 }
 
 # ============================================================
@@ -728,7 +785,7 @@ def render_results(df):
     st.subheader("📈 Screening results")
     cols = ["Ticker", "Price", "P/B", "ROE", "Cost of Equity", "WACC", "Start Growth", "Market-Implied Growth",
             "Earnings CAGR", "FCF Yield", "RNOA", "NBC", "FLEV", "Spread", "Accruals", "Implied Omega", "RI Valid",
-            "RI Value", "RI V/P", "RI Conservative Value", "RI Conservative V/P", "DCF Value", "DCF V/P",
+            "RI Value", "RI V/P", "RI Conservative Value", "RI Conservative V/P", "DCF Value", "DCF V/P", "DCF Bear V/P", "DCF Bull V/P",
             "Net Debt ($B)", "Shares Outstanding", "RI Terminal %", "DCF Terminal %", "Verdict"]
     display = df[cols].copy()
     display["Market-Implied Growth"] = display["Market-Implied Growth"].replace(float("inf"), NAN)
@@ -738,7 +795,7 @@ def render_results(df):
         "RNOA": "{:.1%}", "NBC": "{:.1%}", "FLEV": "{:.2f}", "Spread": "{:.1%}", "Accruals": "{:.1%}",
         "Implied Omega": "{:.2f}", "RI Value": "${:,.2f}", "RI V/P": "{:.2f}x",
         "RI Conservative Value": "${:,.2f}", "RI Conservative V/P": "{:.2f}x", "DCF Value": "${:,.2f}",
-        "DCF V/P": "{:.2f}x", "Net Debt ($B)": "${:,.1f}B", "Shares Outstanding": "{:,.0f}",
+        "DCF V/P": "{:.2f}x", "DCF Bear V/P": "{:.2f}x", "DCF Bull V/P": "{:.2f}x", "Net Debt ($B)": "${:,.1f}B", "Shares Outstanding": "{:,.0f}",
         "RI Terminal %": "{:.1%}", "DCF Terminal %": "{:.1%}",
     }
     st.dataframe(style_table(display, fmt), width="stretch", hide_index=True)
@@ -766,6 +823,7 @@ def render_results(df):
         mig_txt = ">50% (beyond model range)" if pd.notna(mig) and mig == float("inf") else (
             "≤ -10% (cheap even with shrinking sales)" if pd.notna(mig) and mig <= -0.10 else fmt_pct(mig))
         st.write(f"**Market-implied starting growth:** {mig_txt} (model start: {fmt_pct(sel['Start Growth'])})")
+        st.write(f"**DCF range (bear / base / bull V/P):** {fmt_num(sel['DCF Bear V/P'])}x / {fmt_num(sel['DCF V/P'])}x / {fmt_num(sel['DCF Bull V/P'])}x")
         if sel["RI Valid"]:
             st.write(f"**RI value / V/P:** ${sel['RI Value']:.2f} / {sel['RI V/P']:.2f}x")
             st.write(f"**Conservative RI value / V/P:** ${sel['RI Conservative Value']:.2f} / {sel['RI Conservative V/P']:.2f}x")
@@ -834,14 +892,14 @@ def render_results(df):
     st.subheader("💸 FCFF forecast")
     used, src = sel["_dcf_inputs"], sel["_dcf_sources"]
     st.caption("Inputs: " + ", ".join(f"{DCF_LABELS[k]} {used[k]:.1%} ({src[k]})" for k in DCF_LABELS)
-               + f", terminal ROIC {used['term_roic']:.1%}")
+               + f", margin path {used['margin']:.1%} to {used['margin_end']:.1%}, terminal ROIC {used['term_roic']:.1%}")
     st.dataframe(style_table(pd.DataFrame(dcf["forecast"]), {
         "Growth": "{:.1%}", "Revenue": "{:,.0f}", "EBIT": "{:,.0f}", "NOPAT": "{:,.0f}", "D&A": "{:,.0f}",
         "CapEx": "{:,.0f}", "ΔNWC": "{:,.0f}", "Net Investment": "{:,.0f}", "FCFF": "{:,.0f}",
         "PV FCFF": "{:,.0f}"}), width="stretch", hide_index=True)
 
     with st.expander("📊 Sensitivity analysis"):
-        g_term, years, g0 = P["terminal_growth"], P["years"], sel["_g0"]
+        g_term, years, g0 = P["terminal_growth"], sel["_years"], sel["_g0"]
         if base:
             st.markdown("**RI value per share: cost of equity vs ω**")
             rows = []
