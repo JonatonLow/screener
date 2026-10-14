@@ -514,7 +514,8 @@ def analyze_company(data, p):
         cons = residual_income_valuation(ri_data, ke + 0.01, cons_omega, g_path, g_term)
         implied_omega = calculate_implied_omega(ri_data, ke, g_path, g_term)
     except ValueError as e:
-        warnings.append(f"Residual income unavailable: {e}.")
+        warnings.append(f"Residual income unavailable: {e}."
+                        + (" Tangible book is negative or missing; untick the tangible-book option to use reported book." if ri_data is not data else ""))
 
     ri_valid = base is not None
     eq_rep = y0["equity"]
@@ -707,7 +708,7 @@ def render_results(df):
             passes = common
         if passes and ri_ok and ri_vp >= strong_ri_vp and pd.notna(iw) and iw <= strong_max_omega:
             return "STRONG CANDIDATE"
-        if passes:
+        if passes and ri_ok:  # a DCF-only pass is capped at WATCH: no second model to confirm it
             return "CANDIDATE"
         if (ri_ok and ri_vp >= min_ri_vp) or dcf_vp >= min_dcf_vp:
             return "WATCH"
