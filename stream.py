@@ -1,4 +1,3 @@
-
 import math
 import sys
 from types import SimpleNamespace
@@ -842,12 +841,26 @@ def analyze_company(data, p):
         ri_status = "Common shareholders' book equity unavailable; only total equity including minority interest was reported"
         warnings.append("Only total equity including minority interest is available; P/B and FLEV are suppressed and RI is disabled because common-equity data is not comparable.")
     roe_rep = ri_data.get("roe_hist") if ri_data.get("roe_hist") is not None else (base["historical_roe"] if base else NAN)
-    if ri_valid and (not pd.notna(ri_pb) or ri_pb > p["max_pb"] or not pd.notna(roe_rep) or roe_rep > p["max_roe"]):
-        ri_valid, implied_omega = False, None
-        ri_status = f"RI P/B ({ri_pb:.2f}x) or ROE ({roe_rep:.1%}) exceeds configured validity limits"
+    ri_limit_breaches = []
+    if not pd.notna(ri_pb):
+        ri_limit_breaches.append("adjusted RI P/B is unavailable")
+    elif ri_pb > p["max_pb"]:
+        ri_limit_breaches.append(f"adjusted RI P/B {ri_pb:.2f}x exceeds the {p['max_pb']:.1f}x limit")
+    if not pd.notna(roe_rep):
+        ri_limit_breaches.append("RI ROE is unavailable")
+    elif roe_rep > p["max_roe"]:
+        ri_limit_breaches.append(f"RI ROE {roe_rep:.1%} exceeds the {p['max_roe']:.1%} limit")
+    if ri_limit_breaches:
+        if ri_valid:
+            ri_valid, implied_omega = False, None
+            ri_status = "; ".join(ri_limit_breaches)
+        else:
+            # Preserve the first failure (e.g. clipped ROE) while exposing additional
+            # independent reasons the RI result must not be used.
+            ri_status = f"{ri_status}; additionally: " + "; ".join(ri_limit_breaches)
+            warnings.append("Additional RI validity issue: " + "; ".join(ri_limit_breaches) + ".")
         warnings.append(
-            f"RI not meaningful: adjusted RI P/B is {ri_pb:.1f}x and RI ROE is {roe_rep:.0%}; "
-            f"the configured limits are P/B ≤ {p['max_pb']:.1f}x and ROE ≤ {p['max_roe']:.0%}. "
+            "RI is not screening-grade: " + "; ".join(ri_limit_breaches) + ". "
             "High P/B or extreme ROE can make book-value-based RI unstable; verdict uses DCF only."
         )
 
@@ -1229,7 +1242,9 @@ if not TEST_MODE:
         c4.metric("Median DCF V/P", f"{df['DCF V/P'].median():.2f}x")
 
         st.subheader("📈 Screening results")
-        cols = ["Ticker", "Currency", "Price", "P/B", "RI P/B", "ROE", "Cost of Equity", "WACC", "Start Growth", "Market-Implied Growth",
+        cols = ["Ticker", "Currency", "Price", "P/B", "RI P/B", "ROE", "Cost of Equity", "WACC",
+                "Normalized Beta Sensitivity", "Normalized Cost of Equity", "Normalized WACC",
+                "Start Growth", "Market-Implied Growth",
                 "Earnings CAGR", "FCF Yield", "RNOA", "NBC", "FLEV", "Spread", "Accruals", "Implied Omega", "RI Valid", "RI Status", "DCF Reliable",
                 "ROE Source", "Valuation Quality", "RI ROE Input", "RI ROE Applied", "RI Terminal Payout", "RI Value", "RI V/P", "RI Conservative Value", "RI Conservative V/P", "DCF Value", "DCF V/P", "DCF Bear V/P", "DCF Bull V/P",
                 "Net Debt (B)", "Shares Outstanding", "RI Terminal Value Share", "RI Terminal ROE", "DCF Terminal Value Share", "DCF Terminal Growth", "DCF Terminal ROIC", "Verdict"]
@@ -1237,6 +1252,7 @@ if not TEST_MODE:
         display["Market-Implied Growth"] = display["Market-Implied Growth"].replace(float("inf"), NAN)
         fmt = {
             "Price": "{:.2f}", "P/B": "{:.2f}x", "RI P/B": "{:.2f}x", "ROE": "{:.1%}", "Cost of Equity": "{:.1%}", "WACC": "{:.1%}",
+            "Normalized Beta Sensitivity": "{:.2f}", "Normalized Cost of Equity": "{:.1%}", "Normalized WACC": "{:.1%}",
             "Start Growth": "{:.1%}", "Market-Implied Growth": "{:.1%}", "Earnings CAGR": "{:.1%}", "FCF Yield": "{:.1%}",
             "RNOA": "{:.1%}", "NBC": "{:.1%}", "FLEV": "{:.2f}", "Spread": "{:.1%}", "Accruals": "{:.1%}",
             "Implied Omega": "{:.2f}", "RI Value": "{:,.2f}", "RI V/P": "{:.2f}x",
@@ -1767,6 +1783,16 @@ class ScreenerSmokeTests(unittest.TestCase):
         self.assertGreater(out["Normalized Cost of Equity"], out["Cost of Equity"])
         self.assertTrue(any("Blume-adjusted beta sensitivity" in w for w in out["warnings"]))
 
+    def test_ri_reports_pb_limit_even_when_roe_clipping_already_invalidates_ri(self):
+        data = self.synthetic_company(beta=0.32, roe_hist=0.428, price=90.76, shares=4.3e9)
+        data["years"][0].update({"equity": 25e9, "goodwill": 35e9})
+        data["years"][1].update({"equity": 24e9, "goodwill": 34e9})
+        out = NS["analyze_company"](data, self.model_params())
+        self.assertFalse(out["RI Valid"])
+        self.assertIn("clipped", out["RI Status"].lower())
+        self.assertIn("adjusted ri p/b", out["RI Status"].lower())
+        self.assertTrue(any("Additional RI validity issue" in w for w in out["warnings"]))
+
     def test_low_capm_cost_of_equity_downgrades_dcf_reliability(self):
         data = self.synthetic_company(beta=0.2)
         params = self.model_params()
@@ -1822,4 +1848,3 @@ class ScreenerSmokeTests(unittest.TestCase):
 
 if __name__ == "__main__" and TEST_MODE:
     unittest.main(verbosity=2)
-
