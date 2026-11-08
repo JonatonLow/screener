@@ -82,6 +82,27 @@ def total_debt_for_period(balance, col=0):
     return long_term + current if long_term is not None and current is not None else None
 
 
+def total_liabilities_for_period(balance, col=0):
+    """Return reported total liabilities, or derive them from the balance-sheet identity."""
+    reported = pick(balance, [
+        "Total Liabilities Net Minority Interest", "Total Liabilities",
+        "Total Liabilities Excluding Minority Interest",
+    ], col)
+    if reported is not None:
+        return reported, "Yahoo reported total liabilities"
+
+    assets = pick(balance, ["Total Assets"], col)
+    # Prefer total equity including non-controlling interests for the accounting identity.
+    total_equity = pick(balance, [
+        "Total Equity Gross Minority Interest", "Total Stockholders Equity",
+        "Total Stockholder Equity", "Stockholders Equity", "Total Equity",
+        "Common Stock Equity",
+    ], col)
+    if assets is not None and total_equity is not None and assets >= total_equity:
+        return assets - total_equity, "derived: total assets minus total equity"
+    return None, "unavailable"
+
+
 def equity_row_source(df, col=0):
     if df is None or df.empty or col >= df.shape[1]:
         return None
@@ -323,18 +344,33 @@ def fetch_yahoo_company(symbol):
 
     years = []
     for col in (0, 1):
+        assets = pick(bs, ["Total Assets"], col)
+        equity = pick(bs, EQUITY, col)
+        liab, liab_source = total_liabilities_for_period(bs, col)
+        minority_reported = pick(bs, [
+            "Minority Interest", "Minority Interest And Preferred Stock",
+            "Noncontrolling Interest", "Non Controlling Interest",
+            "Noncontrolling Interests", "Minority Interest in Subsidiaries",
+        ], col)
+        # Yahoo often omits a separate NCI row even when the company has no material NCI.
+        # Use zero only to keep the exploratory DCF bridge calculable, and retain an explicit
+        # source flag so the estimate remains provisional until the latest filing is checked.
+        minority_assumed_zero = minority_reported is None
         years.append({
             "fiscal_period": str(pd.Timestamp(bs.columns[col]).date()) if col < len(bs.columns) else None,
-            "assets": pick(bs, ["Total Assets"], col),
-            "liab": pick(bs, ["Total Liabilities Net Minority Interest", "Total Liabilities"], col),
+            "assets": assets,
+            "liab": liab,
+            "liab_source": liab_source,
             "debt": total_debt_for_period(bs, col),
             "cash": pick(bs, ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents", "Cash Financial"], col),
-            "equity": pick(bs, EQUITY, col),
+            "equity": equity,
             "equity_source": equity_row_source(bs, col),
             "cur_assets": pick(bs, ["Total Current Assets", "Current Assets"], col),
             "cur_liab": pick(bs, ["Total Current Liabilities", "Current Liabilities"], col),
             "cur_debt": pick(bs, ["Current Debt And Capital Lease Obligation", "Current Debt"], col),
-            "minority": pick(bs, ["Minority Interest"], col),
+            "minority": 0.0 if minority_assumed_zero else minority_reported,
+            "minority_source": "not separately reported by Yahoo; assumed zero pending filing verification" if minority_assumed_zero else "Yahoo reported",
+            "minority_assumed_zero": minority_assumed_zero,
             "goodwill": pick(bs, ["Goodwill And Other Intangible Assets", "Goodwill"], col),
         })
 
@@ -1048,6 +1084,15 @@ def analyze_company(data, p):
     dcf_inputs["term_roic"] = clamp(terminal_roic_raw, roic_floor, hi)
     dcf = dcf_valuation(data, wacc, g_path, g_term, **dcf_inputs)
     implied_g = implied_start_growth(data, wacc, g_term, years, dcf_inputs)
+    # Explicit valuation sensitivity using the Blume-adjusted WACC; this does not
+    # replace the Yahoo-beta headline DCF or silently alter the base-case discount rate.
+    dcf_normalized_beta_vp = NAN
+    if math.isfinite(normalized_wacc) and normalized_wacc > g_term:
+        try:
+            norm_dcf = dcf_valuation(data, normalized_wacc, g_path, g_term, **dcf_inputs)
+            dcf_normalized_beta_vp = norm_dcf["V/P"] if norm_dcf["value_per_share"] > 0 else NAN
+        except Exception:
+            pass
     dcf_ok = dcf["value_per_share"] > 0
 
     def scenario_vp(g_mult, g_add, margin_add, roic_add):
@@ -1083,8 +1128,8 @@ def analyze_company(data, p):
 
     if data.get("effective_tax_rate") is None:
         warnings.append("Effective tax rate unavailable: DCF uses its configured tax fallback, while WACC's after-tax debt shield uses a separate 21% fallback. Review both assumptions.")
-    if y0.get("minority") is None:
-        warnings.append("Minority interest was not reported; DCF is disabled because the enterprise-to-equity bridge is incomplete.")
+    if y0.get("minority_assumed_zero") or str(y0.get("minority_source", "")).startswith("not separately reported"):
+        warnings.append("Minority interest is not separately reported by Yahoo; zero is used only to display an exploratory DCF. Verify the latest filing for non-controlling interests or preferred claims before relying on the enterprise-to-equity bridge.")
     if not p["override"]:
         for k, source in dcf_sources.items():
             if source == "sidebar":
@@ -1129,7 +1174,7 @@ def analyze_company(data, p):
     )
     shares_are_current = data.get("shares_source") == "Yahoo current shares outstanding"
     price_is_current = data.get("price_source") == "Yahoo current/regular market price"
-    minority_is_known = y0.get("minority") is not None
+    minority_is_known = y0.get("minority") is not None and not y0.get("minority_assumed_zero", False)
     growth_is_unclipped = warnings_note is None and not (p["use_company_growth"] and data.get("rev_cagr") is None)
     dcf_inputs_are_company_reported = all(source == "company" for source in dcf_sources.values())
     terminal_dependence_ok = dcf["terminal_pct"] is not None and dcf["terminal_pct"] <= 0.65
@@ -1216,6 +1261,7 @@ def analyze_company(data, p):
         "Normalized Beta Sensitivity": normalized_beta,
         "Normalized Cost of Equity": normalized_ke,
         "Normalized WACC": normalized_wacc,
+        "DCF V/P at Normalized WACC": dcf_normalized_beta_vp,
         "Start Growth": g0,
         "Market-Implied Growth": implied_g,
         "Earnings CAGR": data.get("earnings_cagr"),
@@ -1590,12 +1636,26 @@ if not TEST_MODE:
             if t is not None:
                 st.dataframe(t, width="stretch")
 
+            st.markdown("**DCF value per share: terminal ROIC stress test**")
+            rows = []
+            base_roic = sel["_dcf_inputs"]["term_roic"]
+            for roic_delta in (-0.05, -0.03, 0.0, 0.03, 0.05):
+                try:
+                    stress_inputs = dict(sel["_dcf_inputs"])
+                    stress_inputs["term_roic"] = max(g_term + 0.005, base_roic + roic_delta)
+                    val = dcf_valuation(data, sel["_wacc"], growth_path(g0, g_term, years), g_term, **stress_inputs)["value_per_share"]
+                    rows.append({"Terminal ROIC": stress_inputs["term_roic"], "v": val})
+                except Exception:
+                    pass
+            if rows:
+                st.dataframe(pd.DataFrame(rows).set_index("Terminal ROIC").style.format("{:,.2f}", na_rep="—"), width="stretch")
+
         with st.expander("📚 How to read this"):
             st.markdown(
                 """
     **Residual income:** value = book equity + PV of forecast residual income. This is an ROE/book-equity model; it does not use the DCF revenue-growth path to forecast earnings, so the RI forecast deliberately does not display that revenue-growth path. Forecast book equity rolls forward as beginning book + earnings − modeled payouts. RI is disabled when payout data or defensible ROE is unavailable, or when payout is outside 0–100%. In the terminal steady state, payout is set to 1 − terminal growth / terminal ROE so retained earnings imply the stated book-equity growth. This remains approximate because Yahoo summaries do not provide a full clean-surplus equity roll-forward or other-comprehensive-income reconciliation.
 
-    **DCF:** FCFF = NOPAT − (CapEx − D&A + change in operating NWC). Net investment can be negative in a cash-release year; investigate whether that is sustainable rather than flooring it to zero. Revenue growth fades linearly to terminal growth; terminal FCFF = NOPAT × (1 + g) × (1 − g/ROIC), so terminal reinvestment matches growth. “DCF Terminal Value Share” is discounted terminal value divided by enterprise value, not the terminal growth rate. Missing cash, debt or minority interest disables DCF rather than assuming zero minority interest. Operating NWC remains a Yahoo summary-line approximation and should be manually checked against detailed filings.
+    **DCF:** FCFF = NOPAT − (CapEx − D&A + change in operating NWC). Net investment can be negative in a cash-release year; investigate whether that is sustainable rather than flooring it to zero. Revenue growth fades linearly to terminal growth; terminal FCFF = NOPAT × (1 + g) × (1 − g/ROIC), so terminal reinvestment matches growth. “DCF Terminal Value Share” is discounted terminal value divided by enterprise value, not the terminal growth rate. Missing cash or debt disables DCF. If Yahoo omits minority interest, zero is used only for an exploratory DCF and the equity bridge is explicitly marked provisional until checked against the latest filing. Operating NWC remains a Yahoo summary-line approximation and should be manually checked against detailed filings.
 
     **Input-quality gate:** a DCF estimate can be displayed for exploration when an assumption is substituted, clipped, unusual, or unavailable, but it is marked provisional and cannot qualify a stock as a candidate. RI is disabled when its book-equity denominator, ROE, payout bridge, fiscal-period alignment or common-equity basis is not defensible. Yahoo does not provide a complete OCI/share-issuance/SBC bridge; RI clean-surplus checks are therefore provisional, not filing-level assurance.
 
@@ -1684,7 +1744,7 @@ TREE = ast.parse(SOURCE.read_text(encoding="utf-8"))
 FUNCTIONS = {
     "safe_float", "clamp", "pick", "row_values", "spend", "payout_ratio_from_cashflows", "ratio", "fmt_pct", "fmt_num",
     "total_debt_for_period", "equity_row_source", "_period_years", "_cagr_between",
-    "compute_history", "aligned_statement_periods", "_period_map", "normalized_tax_rate", "operating_analysis", "discount_rates", "normalized_beta_sensitivity", "growth_path", "start_growth",
+    "compute_history", "aligned_statement_periods", "_period_map", "normalized_tax_rate", "total_liabilities_for_period", "operating_analysis", "discount_rates", "normalized_beta_sensitivity", "growth_path", "start_growth",
     "residual_income_valuation", "calculate_implied_omega", "dcf_valuation",
     "implied_start_growth", "resolve_dcf_inputs", "analyze_company", "should_skip_company",
     "classify_verdict",
@@ -2059,6 +2119,30 @@ class ScreenerSmokeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "minority interest is unavailable"):
             NS["dcf_valuation"](data, 0.09, self.path, 0.025, margin=0.20, tax=0.20,
                                 capex_ratio=0.05, dep_ratio=0.03, nwc_ratio=0.10, term_roic=0.12)
+
+    def test_liabilities_are_derived_from_balance_sheet_identity_when_missing(self):
+        balance = pd.DataFrame({pd.Timestamp("2025-12-31"): [1000.0, 700.0]},
+                               index=["Total Assets", "Total Equity Gross Minority Interest"])
+        value, source = NS["total_liabilities_for_period"](balance, 0)
+        self.assertEqual(value, 300.0)
+        self.assertIn("derived", source)
+
+    def test_missing_yahoo_minority_can_be_zero_assumed_for_exploratory_dcf(self):
+        data = self.company_case("MSFT")
+        for year in data["years"]:
+            year["minority"] = 0.0
+            year["minority_assumed_zero"] = True
+            year["minority_source"] = "not separately reported by Yahoo; assumed zero pending filing verification"
+        result = NS["analyze_company"](data, self.analysis_params())
+        self.assertTrue(math.isfinite(result["DCF V/P"]))
+        self.assertFalse(result["DCF Reliable"])
+        self.assertTrue(any("not separately reported by Yahoo" in warning for warning in result["warnings"]))
+
+    def test_normalized_beta_dcf_value_is_reported_separately(self):
+        data = self.company_case("MSFT")
+        result = NS["analyze_company"](data, self.analysis_params())
+        self.assertTrue(math.isfinite(result["DCF V/P at Normalized WACC"]))
+        self.assertAlmostEqual(result["Normalized Beta Sensitivity"], 0.67 * data["beta"] + 0.33)
 
 
 if __name__ == "__main__" and TEST_MODE:
